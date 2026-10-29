@@ -31,25 +31,59 @@ public struct RoundTripStatistics<Key: Hashable> {
     /// How many of the most recent round trips each key keeps.
     public let windowSize: Int
 
+    private var windows: [Key: RoundTripWindow] = [:]
+
     public init(windowSize: Int = 1000) {
         self.windowSize = windowSize
     }
 
     public mutating func record(_ roundTrip: TimeInterval, for key: Key) {
-        fatalError("Not implemented yet")
+        windows[key, default: RoundTripWindow()].append(roundTrip, keeping: max(1, windowSize))
     }
 
     /// The summary of `key`'s window, or `nil` when nothing was recorded for it.
     public func summary(for key: Key) -> RoundTripSummary? {
-        fatalError("Not implemented yet")
+        guard let window = windows[key], !window.values.isEmpty else {
+            return nil
+        }
+        let sorted = window.values.sorted()
+        return RoundTripSummary(
+            count: sorted.count,
+            total: window.total,
+            median: RoundTripWindow.nearestRank(0.5, in: sorted),
+            p99: RoundTripWindow.nearestRank(0.99, in: sorted)
+        )
     }
 
     /// Every key with at least one round trip recorded.
     public var keys: [Key] {
-        fatalError("Not implemented yet")
+        return Array(windows.keys)
     }
 
     public mutating func reset() {
-        fatalError("Not implemented yet")
+        windows.removeAll()
+    }
+}
+
+/// The most recent values of one key, in a ring, and how many were ever recorded.
+private struct RoundTripWindow {
+    private(set) var values: [TimeInterval] = []
+    private(set) var total = 0
+    private var oldest = 0
+
+    mutating func append(_ value: TimeInterval, keeping capacity: Int) {
+        total += 1
+        if values.count < capacity {
+            values.append(value)
+        } else {
+            values[oldest] = value
+            oldest = (oldest + 1) % capacity
+        }
+    }
+
+    /// The value at rank ⌈`fraction` × n⌉ of the `n` sorted values.
+    static func nearestRank(_ fraction: Double, in sorted: [TimeInterval]) -> TimeInterval {
+        let rank = Int((fraction * Double(sorted.count)).rounded(.up))
+        return sorted[min(max(rank - 1, 0), sorted.count - 1)]
     }
 }

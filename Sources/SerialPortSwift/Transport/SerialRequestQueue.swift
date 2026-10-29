@@ -66,6 +66,62 @@ public final class SerialRequestQueue: SerialTransport {
     public let configuration: Configuration
     public weak var delegate: SerialTransportDelegate?
 
+    private enum Connection {
+        case closed
+        case opening
+        case open
+        case closing
+    }
+
+    private enum Queued {
+        case write(Data)
+        case exchange(SerialExchange)
+    }
+
+    /// The exchange whose frame was written and whose reply is awaited. `token` names its timer.
+    private struct OnTheWire {
+        let exchange: SerialExchange
+        let writtenAt: UInt64
+        let token: Int
+    }
+
+    /// Receives what the stream reports and passes it on, so the queue itself is not a
+    /// ``SerialByteStreamDelegate``. The queue owns it; it holds the queue weakly.
+    private final class StreamListener: SerialByteStreamDelegate {
+        weak var owner: SerialRequestQueue?
+
+        func streamDidOpen(_ stream: SerialByteStream) {
+            owner?.streamDidOpen()
+        }
+
+        func stream(_ stream: SerialByteStream, didReceive bytes: Data) {
+            // Stamped here, before any hop, so the times are those of arrival.
+            owner?.streamDidReceive(bytes, at: Date(), monotonic: DispatchTime.now().uptimeNanoseconds)
+        }
+
+        func streamDidClose(_ stream: SerialByteStream, reason: SerialCloseReason) {
+            owner?.streamDidClose(reason)
+        }
+    }
+
+    private let serial: ExecutionQueue
+    private let delivery: ExecutionQueue
+    private let observers = WeakObserverSet()
+    private let listener = StreamListener()
+
+    // Everything below is touched on `serial` only.
+    private var connection = Connection.closed
+    private var queued: [Queued] = []
+    private var onTheWire: OnTheWire?
+    private var replyBuffer = Data()
+    private var gap: TimeInterval
+    private var inGap = false
+    private var timeoutToken = 0
+    private var gapToken = 0
+    /// Changes whenever a session ends, so nothing from before is reported after.
+    private var generation = 0
+    private var idleWaiters: [() -> Void] = []
+
     /// - Parameters:
     ///   - queue: the serial queue all state lives on. Pass the queue the stream reads on to save a
     ///     hop on every chunk received; by default the queue makes its own.
@@ -78,7 +134,15 @@ public final class SerialRequestQueue: SerialTransport {
         self.stream = stream
         self.matcher = matcher
         self.configuration = configuration
-        fatalError("Not implemented yet")
+        if let queue = queue {
+            self.serial = ExecutionQueue(queue: queue)
+        } else {
+            self.serial = ExecutionQueue(label: "SerialPortSwift.SerialRequestQueue")
+        }
+        self.delivery = ExecutionQueue(queue: configuration.deliveryQueue)
+        self.gap = configuration.postTimeoutGap
+        self.listener.owner = self
+        stream.delegate = self.listener
     }
 
     public var name: String {
@@ -86,7 +150,7 @@ public final class SerialRequestQueue: SerialTransport {
     }
 
     public var isOpen: Bool {
-        fatalError("Not implemented yet")
+        return serial.sync { self.connection == .open }
     }
 
     public var defaultTimeout: TimeInterval {
@@ -96,41 +160,310 @@ public final class SerialRequestQueue: SerialTransport {
     /// The pause after a timeout. Starts at ``Configuration/postTimeoutGap``; can be changed while the
     /// queue runs, and applies from the next timeout.
     public var postTimeoutGap: TimeInterval {
-        get { fatalError("Not implemented yet") }
-        set { fatalError("Not implemented yet") }
+        get { return serial.sync { self.gap } }
+        set { serial.sync { self.gap = newValue } }
     }
 
     public func open() {
-        fatalError("Not implemented yet")
+        let shouldOpen = serial.sync { () -> Bool in
+            guard self.connection == .closed else {
+                return false
+            }
+            self.connection = .opening
+            return true
+        }
+        if shouldOpen {
+            stream.open()
+        }
     }
 
     public func close() {
-        fatalError("Not implemented yet")
+        let shouldClose = serial.sync { () -> Bool in
+            guard self.connection != .closed && self.connection != .closing else {
+                return false
+            }
+            self.connection = .closing
+            self.endSession()
+            return true
+        }
+        if shouldClose {
+            stream.close()
+        }
     }
 
     public func send(_ exchange: SerialExchange) {
-        fatalError("Not implemented yet")
+        enqueue(.exchange(exchange))
     }
 
     public func sendWithoutReply(_ frame: Data) {
-        fatalError("Not implemented yet")
+        enqueue(.write(frame))
     }
 
     public func cancelQueuedExchanges() -> [SerialExchangeID] {
-        fatalError("Not implemented yet")
+        return serial.sync { () -> [SerialExchangeID] in
+            var cancelled: [SerialExchangeID] = []
+            var kept: [Queued] = []
+            for item in self.queued {
+                switch item {
+                case .exchange(let exchange):
+                    cancelled.append(exchange.id)
+                case .write:
+                    kept.append(item)
+                }
+            }
+            guard !cancelled.isEmpty else {
+                return cancelled
+            }
+            self.queued = kept
+            self.publish(.cancelled(cancelled))
+            if self.isIdle {
+                self.dispatchIdleWaiters()
+            }
+            return cancelled
+        }
     }
 
     /// Runs `work` on the delivery queue as soon as nothing is queued and nothing is on the wire — at
     /// once if that is already so. A closed queue counts as idle.
     public func whenIdle(_ work: @escaping () -> Void) {
-        fatalError("Not implemented yet")
+        serial.run {
+            if self.connection == .closed || self.isIdle {
+                self.delivery.async(work)
+            } else {
+                self.idleWaiters.append(work)
+            }
+        }
     }
 
     public func addObserver(_ observer: SerialQueueObserver) {
-        fatalError("Not implemented yet")
+        observers.add(observer)
     }
 
     public func removeObserver(_ observer: SerialQueueObserver) {
-        fatalError("Not implemented yet")
+        observers.remove(observer)
+    }
+
+    // MARK: - Queueing
+
+    private func enqueue(_ item: Queued) {
+        serial.run {
+            guard self.connection == .open || self.connection == .opening else {
+                return
+            }
+            self.queued.append(item)
+            self.pump()
+        }
+    }
+
+    /// Nothing queued and nothing on the wire.
+    private var isIdle: Bool {
+        return queued.isEmpty && onTheWire == nil
+    }
+
+    /// Writes what is next in line, until an exchange is on the wire or the line is empty.
+    private func pump() {
+        while connection == .open && onTheWire == nil && !inGap && !queued.isEmpty {
+            switch queued.removeFirst() {
+            case .write(let frame):
+                stream.write(frame)
+                publish(.sent(nil), bytes: frame)
+            case .exchange(let exchange):
+                replyBuffer = Data()
+                stream.write(exchange.frame)
+                let writtenAt = DispatchTime.now().uptimeNanoseconds
+                timeoutToken += 1
+                let token = timeoutToken
+                onTheWire = OnTheWire(exchange: exchange, writtenAt: writtenAt, token: token)
+                publish(.sent(exchange.id), bytes: exchange.frame)
+                let timeout = exchange.timeout ?? configuration.defaultTimeout
+                serial.asyncAfter(timeout) { [weak self] in
+                    self?.timeoutFired(token)
+                }
+            }
+        }
+        if connection == .open && isIdle {
+            dispatchIdleWaiters()
+        }
+    }
+
+    private func timeoutFired(_ token: Int) {
+        guard let flight = onTheWire, flight.token == token, connection == .open else {
+            return
+        }
+        publish(.timedOut(flight.exchange.id), bytes: flight.exchange.frame)
+        onTheWire = nil
+        replyBuffer = Data()
+        let expected = generation
+        deliver(expecting: expected) { delegate in
+            delegate.transport(self, didTimeOut: flight.exchange)
+        }
+        if gap > 0 {
+            inGap = true
+            gapToken += 1
+            let gapEnd = gapToken
+            serial.asyncAfter(gap) { [weak self] in
+                self?.gapEnded(gapEnd)
+            }
+            if queued.isEmpty {
+                dispatchIdleWaiters()
+            }
+        } else {
+            pump()
+        }
+    }
+
+    private func gapEnded(_ token: Int) {
+        guard inGap, gapToken == token else {
+            return
+        }
+        inGap = false
+        pump()
+    }
+
+    // MARK: - Receiving
+
+    private func streamDidReceive(_ chunk: Data, at date: Date, monotonic: UInt64) {
+        serial.run {
+            self.process(chunk, arrivedAt: date, monotonic: monotonic)
+        }
+    }
+
+    private func process(_ chunk: Data, arrivedAt date: Date, monotonic: UInt64) {
+        guard connection != .closed else {
+            return
+        }
+        publish(.raw, bytes: chunk, date: date)
+        if inGap {
+            publish(.lateBytesDropped, bytes: chunk)
+            return
+        }
+        guard let flight = onTheWire else {
+            publish(.unsolicitedBytesDropped, bytes: chunk)
+            return
+        }
+        let limit = max(1, configuration.maximumReplyLength)
+        let bytes = Array(chunk)
+        for (position, byte) in bytes.enumerated() {
+            replyBuffer.append(byte)
+            if replyBuffer.count > limit {
+                replyBuffer = Data(replyBuffer.suffix(limit))
+            }
+            let scan = matcher.scan(replyBuffer, expecting: flight.exchange.reply)
+            if let unreadable = scan.unreadable {
+                publish(.unreadableCandidate(flight.exchange.id), bytes: unreadable)
+            }
+            guard let packet = scan.packet else {
+                continue
+            }
+            timeoutToken += 1
+            let elapsed = monotonic > flight.writtenAt ? monotonic - flight.writtenAt : 0
+            onTheWire = nil
+            replyBuffer = Data()
+            publish(.answered(flight.exchange.id, roundTrip: TimeInterval(elapsed) / 1_000_000_000), bytes: packet)
+            let expected = generation
+            deliver(expecting: expected) { delegate in
+                delegate.transport(self, didAnswer: flight.exchange, with: packet)
+            }
+            if position + 1 < bytes.count {
+                publish(.unsolicitedBytesDropped, bytes: Data(bytes[(position + 1)...]))
+            }
+            pump()
+            return
+        }
+    }
+
+    // MARK: - Stream events
+
+    private func streamDidOpen() {
+        let opened = serial.sync { () -> Bool in
+            guard self.connection == .opening else {
+                return false
+            }
+            self.connection = .open
+            self.publish(.opened)
+            return true
+        }
+        guard opened else {
+            return
+        }
+        delivery.run { [weak self] in
+            if let self = self, let delegate = self.delegate {
+                delegate.transportDidOpen(self)
+            }
+        }
+        serial.async {
+            self.pump()
+        }
+    }
+
+    private func streamDidClose(_ reason: SerialCloseReason) {
+        let waiters = serial.sync { () -> [() -> Void]? in
+            guard self.connection != .closed else {
+                return nil
+            }
+            self.connection = .closed
+            self.endSession()
+            self.publish(.closed(reason))
+            let waiting = self.idleWaiters
+            self.idleWaiters = []
+            return waiting
+        }
+        guard let idle = waiters else {
+            return
+        }
+        delivery.run { [weak self] in
+            if let self = self, let delegate = self.delegate {
+                delegate.transportDidClose(self, reason: reason)
+            }
+        }
+        for work in idle {
+            delivery.async(work)
+        }
+    }
+
+    /// Forgets everything of the session that ends: timers, what is queued, what is on the wire.
+    private func endSession() {
+        timeoutToken += 1
+        gapToken += 1
+        inGap = false
+        onTheWire = nil
+        replyBuffer = Data()
+        queued = []
+        generation += 1
+    }
+
+    // MARK: - Delivery and observers
+
+    /// Calls the delegate on the delivery queue, later. The call is dropped when the session it
+    /// belongs to (`generation`) has ended by then.
+    private func deliver(expecting generation: Int, _ call: @escaping (SerialTransportDelegate) -> Void) {
+        delivery.async { [weak self] in
+            guard let self = self else {
+                return
+            }
+            let current = self.serial.sync { self.generation }
+            if current == generation, let delegate = self.delegate {
+                call(delegate)
+            }
+        }
+    }
+
+    private func dispatchIdleWaiters() {
+        let waiting = idleWaiters
+        idleWaiters = []
+        for work in waiting {
+            delivery.async(work)
+        }
+    }
+
+    private func publish(_ kind: SerialQueueEvent.Kind, bytes: Data? = nil, date: Date = Date()) {
+        let watching = observers.snapshot()
+        guard !watching.isEmpty else {
+            return
+        }
+        let event = SerialQueueEvent(date: date, kind: kind, bytes: bytes)
+        for observer in watching {
+            observer.requestQueue(self, didLog: event)
+        }
     }
 }

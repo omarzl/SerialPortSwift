@@ -44,7 +44,24 @@ extension ReplyMatcher {
     /// the first one ``verdict(on:expecting:)`` accepts, raw. Called after every byte received, so a
     /// reply is found as soon as its last byte arrives.
     public func scan(_ buffer: Data, expecting shape: ReplyShape) -> ReplyScan {
-        fatalError("Not implemented yet")
+        // Copy to an array first: a `Data` slice keeps its parent's indices, an array does not.
+        let bytes = Array(buffer)
+        guard !bytes.isEmpty else {
+            return ReplyScan(packet: nil, unreadable: nil)
+        }
+        var longestUnreadable: Data?
+        for length in 1...bytes.count {
+            let tail = Data(bytes[(bytes.count - length)...])
+            switch verdict(on: tail, expecting: shape) {
+            case .accepted:
+                return ReplyScan(packet: tail, unreadable: longestUnreadable)
+            case .unreadable:
+                longestUnreadable = tail
+            case .rejected:
+                break
+            }
+        }
+        return ReplyScan(packet: nil, unreadable: longestUnreadable)
     }
 }
 
@@ -74,6 +91,35 @@ public struct TailScanMatcher: ReplyMatcher {
     }
 
     public func verdict(on candidate: Data, expecting shape: ReplyShape) -> ReplyVerdict {
-        fatalError("Not implemented yet")
+        var cleaned = [UInt8]()
+        cleaned.reserveCapacity(candidate.count)
+        for byte in candidate where !fillerBytes.contains(byte) {
+            cleaned.append(byte)
+        }
+        if requiresASCII {
+            for byte in cleaned where byte > 0x7F {
+                return .unreadable
+            }
+        }
+        switch shape {
+        case .anything:
+            return .accepted
+        case .exactly(let length):
+            return measure(cleaned) == length ? .accepted : .rejected
+        }
+    }
+
+    private func measure(_ cleaned: [UInt8]) -> Int {
+        switch lengthUnit {
+        case .bytes:
+            return cleaned.count
+        case .characters:
+            // Latin-1 maps each byte to the scalar of the same value, on every platform.
+            var scalars = String.UnicodeScalarView()
+            for byte in cleaned {
+                scalars.append(Unicode.Scalar(byte))
+            }
+            return String(scalars).count
+        }
     }
 }
