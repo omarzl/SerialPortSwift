@@ -263,7 +263,7 @@ queue.whenIdle {
 
 ### Timeouts
 
-The timer starts when a request is written. If no answer comes in time, the delegate gets `didTimeOut` and the queue moves on to the next request.
+The timer starts when the queue hands the request to the port. If no answer comes in time, the delegate gets `didTimeOut` and the queue moves on to the next request.
 
 A late answer can confuse the request that comes after it. So after a timeout the queue waits a moment (a tenth of a second by default) before it sends the next request, and throws away anything that arrives during that moment.
 
@@ -286,7 +286,7 @@ let queue = SerialRequestQueue(stream: port, matcher: matcher)
 | --- | --- |
 | `fillerBytes` | Padding bytes some devices send (often `0xFF` or `0x00`). They are not counted. Padding before or after the reply is not part of what you get. Padding inside the reply stays. |
 | `requiresASCII` | For devices that talk plain text. A byte above `0x7F` cannot be part of a reply. Observers are told about it, which helps to spot noise or a wrong baud rate. |
-| `lengthUnit` | What `.exactly(n)` counts. `.bytes` is the default. With `.characters` it counts characters the way Swift's `String` does, so `"\r\n"` counts as one. `"OK\r\n"` is four bytes but three characters. |
+| `lengthUnit` | What `.exactly(n)` counts. `.bytes` is the default. With `.characters` it counts characters the way Swift's `String` does, so `"\r\n"` counts as one. `"OK\r\n"` is four bytes but three characters. For replies that end in `"\r\n"`, use `.bytes`: with `.characters` the reply is found as soon as the `"\r"` arrives. |
 
 If your replies follow another rule, write your own matcher. The queue offers it the last byte received, then the last two bytes, and so on. The first one you accept is the reply. For example, a reply that is four bytes long and starts with `0x02`:
 
@@ -321,7 +321,7 @@ let queue = SerialRequestQueue(stream: port, configuration: configuration)
 | Setting | Default | Meaning |
 | --- | --- | --- |
 | `defaultTimeout` | 1 second | How long to wait for a request that has no `timeout` of its own. |
-| `maximumReplyLength` | 64 | The longest reply the queue can recognise, in bytes. Raise it if your replies are longer. |
+| `maximumReplyLength` | 64 | How many of the latest bytes the queue keeps while it waits for a reply. An `.exactly(n)` reply always gets room for its *n* bytes, so this only matters for a matcher of your own that needs longer replies. |
 | `postTimeoutGap` | 0.1 seconds | The pause after a timeout during which late bytes are thrown away. `0` for no pause. |
 | `deliveryQueue` | the main queue | Where your delegate is called. |
 
