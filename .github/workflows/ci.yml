@@ -13,7 +13,7 @@ jobs:
     name: Linux, Swift 5.1
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Build and test with the oldest supported compiler
         run: docker run --rm -v "$PWD:/src" -w /src swift:5.1 swift test --enable-test-discovery
 
@@ -22,7 +22,7 @@ jobs:
     runs-on: ubuntu-latest
     container: swift:6.0
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Build and test
         run: swift test
 
@@ -30,7 +30,7 @@ jobs:
     name: macOS
     runs-on: macos-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Toolchain
         run: swift --version
       - name: Build and test
