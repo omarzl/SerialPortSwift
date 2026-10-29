@@ -27,7 +27,7 @@ let package = Package(
     name: "MyApp",
     platforms: [.macOS(.v10_11)],
     dependencies: [
-        .package(url: "https://github.com/omarzl/SerialPortSwift.git", from: "0.1.0")
+        .package(url: "https://github.com/omarzl/SerialPortSwift.git", from: "1.0.0")
     ],
     targets: [
         .target(
