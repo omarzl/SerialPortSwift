@@ -118,6 +118,22 @@ final class PseudoTerminalTests: XCTestCase {
         XCTAssertTrue(FileManager.default.fileExists(atPath: terminal.devicePath))
     }
 
+    func testTheDevicePathNamesAnUnlockedTerminalDevice() throws {
+        let terminal = try self.makeTerminal()
+
+        #if os(Linux)
+        let prefix = "/dev/pts/"
+        XCTAssertTrue(terminal.devicePath.hasPrefix(prefix), terminal.devicePath)
+        XCTAssertNotNil(Int(terminal.devicePath.dropFirst(prefix.count)), terminal.devicePath)
+        #else
+        XCTAssertTrue(terminal.devicePath.hasPrefix("/dev/tty"), terminal.devicePath)
+        #endif
+        // A locked device side would refuse to open.
+        let deviceSide = self.openDeviceSide(of: terminal)
+        XCTAssertGreaterThanOrEqual(deviceSide, 0)
+        XCTAssertEqual(isatty(deviceSide), 1)
+    }
+
     func testEveryTerminalHasItsOwnDevice() throws {
         let first = try self.makeTerminal()
         let second = try self.makeTerminal()

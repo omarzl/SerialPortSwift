@@ -14,7 +14,8 @@ import Glibc
 /// `open`, `close` and `write`, and the constants the two platforms spell differently.
 ///
 /// `ioctl` requests are macros built from `_IO*`, which Darwin does not import, so they are written out
-/// here for both platforms.
+/// here for Darwin. Linux numbers differ between processor architectures, so there they are the
+/// constants Glibc imports.
 enum Posix {
     // MARK: ioctl requests
 
@@ -27,13 +28,17 @@ enum Posix {
     static let requestModemGet: UInt = 0x4004_746A
     /// `TIOCMSET`: write the modem lines.
     static let requestModemSet: UInt = 0x8004_746D
+    /// `TIOCOUTQ`: the number of bytes in the output queue, as an `int`.
+    static let requestOutputQueue: UInt = 0x4004_7473
     /// `IOSSIOSPEED`: set any speed; takes a `speed_t`.
     static let requestSetSpeed: UInt = 0x8008_5402
     #else
-    static let requestExclusive: UInt = 0x540C
-    static let requestNonExclusive: UInt = 0x540D
-    static let requestModemGet: UInt = 0x5415
-    static let requestModemSet: UInt = 0x5418
+    // The numbers differ between processor architectures, so these are the ones Glibc imports.
+    static let requestExclusive = UInt(TIOCEXCL)
+    static let requestNonExclusive = UInt(TIOCNXCL)
+    static let requestModemGet = UInt(TIOCMGET)
+    static let requestModemSet = UInt(TIOCMSET)
+    static let requestOutputQueue = UInt(TIOCOUTQ)
     #endif
 
     // MARK: Modem line bits (the same on both platforms)
@@ -96,14 +101,6 @@ enum Posix {
         #endif
     }
 
-    static func fcntl(_ descriptor: Int32, _ command: Int32, _ value: Int32) -> Int32 {
-        #if canImport(Darwin)
-        return Darwin.fcntl(descriptor, command, value)
-        #else
-        return Glibc.fcntl(descriptor, command, value)
-        #endif
-    }
-
     /// `flock(2)`. Called unqualified and under another name: `struct flock` shares the name, and a
     /// module-qualified `flock` finds the structure instead of the function.
     static func lockFile(_ descriptor: Int32, _ operation: Int32) -> Int32 {
@@ -141,55 +138,48 @@ enum Posix {
         return Glibc.cfsetspeed(&options, speed)
         #endif
     }
-
-    /// Waits until `descriptor` can take a write, or `milliseconds` pass.
-    static func waitUntilWritable(_ descriptor: Int32, milliseconds: Int32) {
-        var request = pollfd(fd: descriptor, events: Int16(POLLOUT), revents: 0)
-        #if canImport(Darwin)
-        _ = Darwin.poll(&request, nfds_t(1), milliseconds)
-        #else
-        _ = Glibc.poll(&request, nfds_t(1), milliseconds)
-        #endif
-    }
 }
 
 // MARK: - Writing
 
 extension Posix {
-    /// How many times `writeAll` waits ten milliseconds for a descriptor that will not take bytes.
-    private static let writeStallLimit = 200
-
-    /// Writes every byte, retrying after a signal and waiting briefly while the descriptor is full.
-    /// Answers 0 when everything went out, or the `errno` that stopped it.
-    static func writeAll(_ descriptor: Int32, _ bytes: UnsafeRawBufferPointer) -> Int32 {
+    /// Writes as much of `bytes` as the descriptor takes without waiting, retrying after a signal.
+    /// Answers how many bytes went out and why it stopped: 0 when all of them did, `EAGAIN` when the
+    /// descriptor is full, or the `errno` of a failure.
+    static func writeAvailable(
+        _ descriptor: Int32,
+        _ bytes: UnsafeRawBufferPointer
+    ) -> (written: Int, code: Int32) {
         guard let base = bytes.baseAddress else {
-            return 0
+            return (0, 0)
         }
         var offset = 0
-        var stalls = 0
         while offset < bytes.count {
-            let written = Posix.write(descriptor, base + offset, bytes.count - offset)
-            if written > 0 {
-                offset += written
-                stalls = 0
+            let count = Posix.write(descriptor, base + offset, bytes.count - offset)
+            if count > 0 {
+                offset += count
                 continue
             }
-            if written < 0 {
+            if count < 0 {
                 let code = errno
                 if code == EINTR {
                     continue
                 }
-                if code != EAGAIN && code != EWOULDBLOCK {
-                    return code
-                }
+                return (offset, code == EWOULDBLOCK ? EAGAIN : code)
             }
-            stalls += 1
-            if stalls > Posix.writeStallLimit {
-                return EAGAIN
-            }
-            Posix.waitUntilWritable(descriptor, milliseconds: 10)
+            // A write that takes nothing and does not fail: the descriptor is full.
+            return (offset, EAGAIN)
         }
-        return 0
+        return (offset, 0)
+    }
+
+    /// How many bytes the driver still holds to send, or `nil` when it cannot say.
+    static func outputQueueLength(_ descriptor: Int32) -> Int? {
+        var count: Int32 = 0
+        if Posix.ioctl(descriptor, requestOutputQueue, &count) != 0 {
+            return nil
+        }
+        return Int(count)
     }
 }
 
@@ -368,6 +358,18 @@ extension Posix {
         let rtsCtsBits = tcflag_t(CRTSCTS)
         return (rtsCts ? rtsCtsBits : 0, rtsCtsBits)
         #endif
+    }
+
+    /// Switches hardware flow control off on a line that is open, so output a stopped peer was holding
+    /// back can leave. A failure is ignored: the device may be gone.
+    static func clearFlowControl(_ descriptor: Int32) {
+        var options = termios()
+        if Posix.tcgetattr(descriptor, &options) != 0 {
+            return
+        }
+        let mask = flowControlBits(rtsCts: true, dtrDsr: true, dcdOutput: true).mask
+        options.c_cflag &= ~mask
+        _ = Posix.tcsetattr(descriptor, TCSANOW, &options)
     }
 
     /// The settings that put a line in the state `configuration` asks for, starting from `current` so

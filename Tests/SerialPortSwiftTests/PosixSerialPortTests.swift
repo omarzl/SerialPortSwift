@@ -145,6 +145,39 @@ private func closeDescriptor(_ descriptor: Int32) {
     _ = close(descriptor)
 }
 
+/// Bytes whose value depends on their position and on `seed`, so a lost, repeated or reordered
+/// byte shows.
+private func pattern(count: Int, seed: Int = 0) -> Data {
+    return Data((0..<count).map { UInt8(truncatingIfNeeded: ($0 &* 31) &+ ($0 >> 8) &+ seed) })
+}
+
+/// Where a call made on another thread leaves its answer.
+private final class CallResult<T> {
+    var value: T?
+    var seconds: TimeInterval = 0
+}
+
+/// Runs `work` on a thread of its own and waits up to `timeout` for it, so a call that hangs fails
+/// the test instead of freezing it. Answers what it returned and how long it took, or `nil` when it
+/// did not return in time.
+private func finish<T>(within timeout: TimeInterval, _ work: @escaping () -> T) -> (value: T, seconds: TimeInterval)? {
+    let result = CallResult<T>()
+    let done = DispatchSemaphore(value: 0)
+    DispatchQueue.global().async {
+        let start = Date()
+        result.value = work()
+        result.seconds = Date().timeIntervalSince(start)
+        done.signal()
+    }
+    if done.wait(timeout: .now() + timeout) == .timedOut {
+        return nil
+    }
+    guard let value = result.value else {
+        return nil
+    }
+    return (value, result.seconds)
+}
+
 private func lineSettings(of descriptor: Int32) -> termios {
     var settings = termios()
     XCTAssertEqual(tcgetattr(descriptor, &settings), 0, "tcgetattr failed: errno \(errno)")
@@ -362,6 +395,115 @@ final class PosixSerialPortTests: XCTestCase {
         XCTAssertEqual(terminal.read(count: payload.count, timeout: 30), payload)
     }
 
+    // MARK: A device that cannot take what it is given
+
+    func testAWriteTheDeviceCannotTakeDoesNotHoldUpThePort() throws {
+        let terminal = try self.makeTerminal()
+        let (port, recorder) = self.makePort(on: terminal)
+        port.open()
+        let payload = pattern(count: 4 * 1024 * 1024)
+
+        // Nobody reads the other end, so most of this cannot go out.
+        port.write(payload)
+
+        let isOpen = finish(within: 30) { port.isOpen }
+        XCTAssertEqual(isOpen?.value, true)
+        XCTAssertLessThan(isOpen?.seconds ?? .infinity, 1)
+        let lines = finish(within: 30) { port.readModemLines() }
+        XCTAssertNotNil(lines, "readModemLines did not return")
+        XCTAssertLessThan(lines?.seconds ?? .infinity, 1)
+        // A close may wait up to half a second for the driver to send what it holds.
+        let closed = finish(within: 30) { port.close() }
+        XCTAssertNotNil(closed, "close did not return")
+        XCTAssertLessThan(closed?.seconds ?? .infinity, 3)
+        XCTAssertEqual(recorder.closes, [.requested])
+        XCTAssertFalse(port.isOpen)
+    }
+
+    func testAWriteAfterABigOneArrivesInOrderOnceThePeerReads() throws {
+        let terminal = try self.makeTerminal()
+        let (port, recorder) = self.makePort(on: terminal)
+        port.open()
+        let big = pattern(count: 4 * 1024 * 1024, seed: 1)
+        let small = Data("after the big one".utf8)
+
+        port.write(big)
+        port.write(small)
+        // The port is still free to answer while everything waits.
+        XCTAssertTrue(port.isOpen)
+
+        let received = terminal.read(count: big.count + small.count, timeout: 60)
+        XCTAssertEqual(received?.count, big.count + small.count)
+        XCTAssertTrue(received == big + small, "the bytes arrived changed or out of order")
+        XCTAssertEqual(terminal.read(timeout: 0.2), Data())
+
+        // With nothing waiting any more, a write goes straight out again.
+        port.write(Data("tail".utf8))
+        XCTAssertEqual(terminal.read(count: 4, timeout: 15), Data("tail".utf8))
+        XCTAssertTrue(port.isOpen)
+        XCTAssertEqual(recorder.closes, [])
+    }
+
+    func testManyWritesBehindABlockedOneKeepTheirOrder() throws {
+        let terminal = try self.makeTerminal()
+        let (port, recorder) = self.makePort(on: terminal)
+        port.open()
+        var expected = Data()
+        for index in 0..<400 {
+            // Sizes that differ, so no two neighbours line up with the driver's buffer.
+            let chunk = pattern(count: 5_000 + (index % 7) * 1_111, seed: index)
+            expected.append(chunk)
+            port.write(chunk)
+        }
+
+        let received = terminal.read(count: expected.count, timeout: 60)
+
+        XCTAssertEqual(received?.count, expected.count)
+        XCTAssertTrue(received == expected, "the bytes arrived changed or out of order")
+        XCTAssertTrue(port.isOpen)
+        XCTAssertEqual(recorder.closes, [])
+    }
+
+    func testClosingDropsWhatTheDeviceHasNotTaken() throws {
+        let terminal = try self.makeTerminal()
+        let (port, recorder) = self.makePort(on: terminal)
+        port.open()
+        let payload = pattern(count: 4 * 1024 * 1024, seed: 3)
+        port.write(payload)
+        XCTAssertTrue(port.isOpen)
+
+        port.close()
+
+        // Only what the driver had taken before the close arrives, and it is the start of the payload.
+        let arrived = terminal.read(timeout: 0.5)
+        XCTAssertLessThan(arrived.count, payload.count)
+        XCTAssertEqual(arrived, payload.prefix(arrived.count))
+        XCTAssertEqual(recorder.closes, [.requested])
+
+        // The next time the port is open, nothing of the dropped bytes comes out.
+        port.open()
+        XCTAssertTrue(port.isOpen)
+        _ = terminal.read(timeout: 0.3)
+        port.write(Data("again".utf8))
+        XCTAssertEqual(terminal.read(count: 5, timeout: 15), Data("again".utf8))
+        XCTAssertEqual(terminal.read(timeout: 0.2), Data())
+    }
+
+    func testThePortReadsWhileAWriteWaits() throws {
+        let terminal = try self.makeTerminal()
+        let (port, recorder) = self.makePort(on: terminal)
+        port.open()
+        port.write(pattern(count: 2 * 1024 * 1024, seed: 4))
+        XCTAssertTrue(port.isOpen)
+        let arrived = recorder.expectBytes(3)
+
+        // The device side is not reading, but it can still talk.
+        try terminal.write(Data([0x0A, 0x0B, 0x0C]))
+
+        self.wait(for: [arrived], timeout: 15)
+        XCTAssertEqual(recorder.received, Data([0x0A, 0x0B, 0x0C]))
+    }
+
     func testWritingNothingDoesNothing() throws {
         let terminal = try self.makeTerminal()
         let (port, recorder) = self.makePort(on: terminal)
@@ -402,14 +544,35 @@ final class PosixSerialPortTests: XCTestCase {
 
         self.wait(for: [closed], timeout: 15)
         Thread.sleep(forTimeInterval: 0.3)
-        XCTAssertEqual(recorder.closes.count, 1)
-        switch recorder.closes.first {
-        case .some(.removed), .some(.failed(.writeFailed)):
-            break
-        default:
-            XCTFail("unexpected close: \(String(describing: recorder.closes.first))")
-        }
+        // A write that finds the device gone is reported like a read that does.
+        XCTAssertEqual(recorder.closes, [.removed])
         XCTAssertFalse(port.isOpen)
+    }
+
+    func testAWriteThatFindsTheDeviceGoneIsNotReportedBeforeItReturns() throws {
+        let terminal = try self.makeTerminal()
+        let queue = DispatchQueue(label: "PosixSerialPortTests.writeOnQueue")
+        let key = DispatchSpecificKey<Bool>()
+        queue.setSpecific(key: key, value: true)
+        let (port, recorder) = self.makePort(on: terminal, queue: queue)
+        recorder.isOnPortQueue = { return DispatchQueue.getSpecific(key: key) == true }
+        port.open()
+        let closed = recorder.expectCloses(1)
+        // Only ever touched on the port's queue.
+        var closesWhenWriteReturned = -1
+        recorder.onReceive = { _ in
+            terminal.close()
+            port.write(Data([0x01, 0x02, 0x03]))
+            closesWhenWriteReturned = recorder.closes.count
+        }
+
+        try terminal.write(Data([0x7E]))
+
+        self.wait(for: [closed], timeout: 15)
+        queue.sync {}
+        XCTAssertEqual(closesWhenWriteReturned, 0)
+        XCTAssertEqual(recorder.closes, [.removed])
+        XCTAssertEqual(recorder.closesOnPortQueue, [true])
     }
 
     // MARK: Exclusive access
@@ -447,6 +610,32 @@ final class PosixSerialPortTests: XCTestCase {
         XCTAssertEqual(firstRecorder.closes, [])
         XCTAssertEqual(secondRecorder.closes, [])
     }
+
+    #if os(Linux)
+    func testTheDescriptorIsNotInheritedByChildProcesses() throws {
+        let terminal = try self.makeTerminal()
+        let (port, _) = self.makePort(on: terminal)
+        port.open()
+
+        let names = try FileManager.default.contentsOfDirectory(atPath: "/proc/self/fd")
+        let descriptors = names.compactMap { name -> Int32? in
+            guard let descriptor = Int32(name),
+                let target = try? FileManager.default.destinationOfSymbolicLink(atPath: "/proc/self/fd/" + name),
+                target == terminal.devicePath
+            else {
+                return nil
+            }
+            return descriptor
+        }
+
+        XCTAssertEqual(descriptors.count, 1, "expected exactly one descriptor on \(terminal.devicePath)")
+        for descriptor in descriptors {
+            let flags = fcntl(descriptor, F_GETFD)
+            XCTAssertGreaterThanOrEqual(flags, 0)
+            XCTAssertNotEqual(flags & FD_CLOEXEC, 0, "the descriptor would survive an exec")
+        }
+    }
+    #endif
 
     // MARK: Close
 

@@ -15,10 +15,11 @@ import Glibc
 ///
 /// Opening it:
 /// 1. opens the device for reading and writing without making it the controlling terminal, without
-///    waiting for carrier, and — with ``SerialPortConfiguration/exclusiveAccess`` — with an exclusive
-///    lock and `TIOCEXCL`, so a second opener is refused
-///    (``SerialStreamError/exclusiveAccessDenied(path:)``);
-/// 2. switches the descriptor back to blocking I/O and remembers the line settings it found;
+///    waiting for carrier, and closed on `exec` so a child process cannot inherit it — with
+///    ``SerialPortConfiguration/exclusiveAccess``, also with an exclusive lock and `TIOCEXCL`, so a
+///    second opener is refused (``SerialStreamError/exclusiveAccessDenied(path:)``);
+/// 2. keeps non-blocking I/O, so a write the device cannot take yet waits without holding up reads,
+///    `close()` or anything else, and remembers the line settings it found;
 /// 3. applies the configuration: raw, the data bits, parity and stop bits asked for, the flow control
 ///    asked for, `HUPCL | CLOCAL | CREAD`, `VMIN 1 / VTIME 2`, the speed (on macOS a speed the
 ///    terminal driver does not list is set with `IOSSIOSPEED`);
@@ -28,8 +29,16 @@ import Glibc
 /// Open and close report synchronously, before they return. Reading happens on the port's queue
 /// through a dispatch read source, so received bytes never wait for the main thread; it starts once
 /// the delegate has heard `streamDidOpen`. A read that finds the device gone (end of file, `ENXIO`,
-/// `EIO`, `ENODEV`) closes the port with ``SerialCloseReason/removed``. Closing restores the line
-/// settings the port found.
+/// `EIO`, `ENODEV`) closes the port with ``SerialCloseReason/removed``.
+///
+/// Writing happens on the port's queue too: the port writes what the device takes at once and keeps
+/// the rest, in order, to write as the device has room again. A write that finds the device gone
+/// (`EIO`, `ENXIO`, `ENODEV`, `EPIPE`) closes the port with `removed`, any other write failure with
+/// ``SerialStreamError/writeFailed(code:)``; both are reported later, on the port's queue.
+///
+/// Closing drops the bytes not yet written, switches hardware flow control off and waits for the
+/// driver to send what it already holds — at most half a second — then restores the line settings
+/// the port found. A close the device forced on the port (removed, failed) does not wait.
 public final class PosixSerialPort: SerialByteStream {
     public let path: String
     public let name: String
@@ -75,7 +84,7 @@ public final class PosixSerialPort: SerialByteStream {
         // Nothing else references the port any more, so its state is ours. The delegate hears nothing.
         if let session = self.session {
             self.session = nil
-            session.shutDown()
+            session.shutDown(waitForOutput: true)
         }
     }
 
@@ -118,12 +127,12 @@ public final class PosixSerialPort: SerialByteStream {
 
     public func close() {
         let calledOnPortQueue = self.executionQueue.isCurrent
-        let descriptorClosed = self.executionQueue.sync { self.tearDownOnQueue() }
+        let descriptorClosed = self.executionQueue.sync { self.tearDownOnQueue(waitForOutput: true) }
         guard let closed = descriptorClosed else {
             return
         }
         if !calledOnPortQueue {
-            // The read source's cancel handler closes the descriptor on the port's queue. Wait for it,
+            // The sources' cancel handlers close the descriptor on the port's queue. Wait for them,
             // so the path can be opened again as soon as this returns.
             closed.wait()
         }
@@ -160,17 +169,36 @@ extension PosixSerialPort {
         case failed(SerialStreamError)
     }
 
-    /// One time the port was open: its descriptor, what the line looked like before, and the source
-    /// that reads it.
+    /// One time the port was open: its descriptor, what the line looked like before, the sources that
+    /// read and write it, and the bytes the device has not taken yet.
     private final class Session {
+        /// How long a close waits for the driver to send what it holds, in nanoseconds.
+        private static let outputWaitLimit: UInt64 = 500_000_000
+        /// How long one step of that wait lasts.
+        private static let outputWaitSlice: TimeInterval = 0.005
+        /// How many written bytes may sit at the front of the waiting bytes before the rest moves up.
+        private static let compactionThreshold = 65_536
+
         let descriptor: Int32
         let number: Int
         let originalSettings: termios
         let exclusive: Bool
-        /// Signalled by the read source's cancel handler once the descriptor is really closed.
+        /// Signalled once the descriptor is really closed, which happens when both sources are
+        /// cancelled.
         let descriptorClosed = DispatchSemaphore(value: 0)
         var readSource: DispatchSourceRead?
         var isReading = false
+        /// Resumed only while bytes wait for room; it is created suspended.
+        var writeSource: DispatchSourceWrite?
+        var isAwaitingRoom = false
+        /// The bytes the device has not taken yet, in the order they were given: `pending` from
+        /// `pendingOffset` on.
+        private var pending = Data()
+        private var pendingOffset = 0
+        /// Set when a write failed or the port is closing; writes after that are dropped.
+        private var writeFailed = false
+        /// How many sources have yet to run their cancel handler. The descriptor closes after the last.
+        private var sourcesToCancel = 2
 
         init(descriptor: Int32, number: Int, originalSettings: termios, exclusive: Bool) {
             self.descriptor = descriptor
@@ -186,10 +214,115 @@ extension PosixSerialPort {
             }
         }
 
-        /// Gives the line back as it was found and cancels the read source, whose cancel handler
-        /// closes the descriptor.
-        func shutDown() {
-            // The device may be gone, so a failure to restore is not worth reporting.
+        /// Called, on the port's queue, by the cancel handler of each source.
+        func sourceDidCancel() {
+            self.sourcesToCancel -= 1
+            if self.sourcesToCancel == 0 {
+                _ = Posix.close(self.descriptor)
+                self.descriptorClosed.signal()
+            }
+        }
+
+        // MARK: Writing
+
+        private var hasPending: Bool {
+            return self.pendingOffset < self.pending.count
+        }
+
+        /// Writes `bytes` behind any that are waiting: what the device takes goes out now, the rest
+        /// waits for room. Answers the `errno` of a failure, or 0.
+        func send(_ bytes: Data) -> Int32 {
+            if self.writeFailed {
+                return 0
+            }
+            if self.hasPending {
+                self.pending.append(bytes)
+                return 0
+            }
+            let descriptor = self.descriptor
+            let result = bytes.withUnsafeBytes { (raw: UnsafeRawBufferPointer) -> (written: Int, code: Int32) in
+                return Posix.writeAvailable(descriptor, raw)
+            }
+            if result.code == 0 {
+                return 0
+            }
+            if result.code != EAGAIN {
+                return result.code
+            }
+            self.pending = bytes.subdata(in: (bytes.startIndex + result.written)..<bytes.endIndex)
+            self.pendingOffset = 0
+            self.awaitRoom()
+            return 0
+        }
+
+        /// Writes what the device takes of the waiting bytes; the rest keeps waiting. Answers the
+        /// `errno` of a failure, or 0.
+        func drain() -> Int32 {
+            if !self.hasPending {
+                self.discardPending()
+                return 0
+            }
+            let descriptor = self.descriptor
+            let offset = self.pendingOffset
+            let result = self.pending.withUnsafeBytes { (raw: UnsafeRawBufferPointer) -> (written: Int, code: Int32) in
+                return Posix.writeAvailable(descriptor, UnsafeRawBufferPointer(rebasing: raw[offset...]))
+            }
+            self.pendingOffset += result.written
+            if result.code == 0 {
+                self.discardPending()
+                return 0
+            }
+            if result.code != EAGAIN {
+                return result.code
+            }
+            // Written bytes do not stay for long: once enough of them sit at the front, the rest moves up.
+            if self.pendingOffset >= Session.compactionThreshold && self.pendingOffset * 2 >= self.pending.count {
+                let start = self.pending.startIndex + self.pendingOffset
+                self.pending = self.pending.subdata(in: start..<self.pending.endIndex)
+                self.pendingOffset = 0
+            }
+            return 0
+        }
+
+        /// Gives up on writing: drops the waiting bytes and ignores later ones.
+        func abandonWrites() {
+            self.writeFailed = true
+            self.discardPending()
+        }
+
+        private func discardPending() {
+            self.pending = Data()
+            self.pendingOffset = 0
+            self.stopAwaitingRoom()
+        }
+
+        private func awaitRoom() {
+            if let source = self.writeSource, !self.isAwaitingRoom {
+                self.isAwaitingRoom = true
+                source.resume()
+            }
+        }
+
+        private func stopAwaitingRoom() {
+            if let source = self.writeSource, self.isAwaitingRoom {
+                self.isAwaitingRoom = false
+                source.suspend()
+            }
+        }
+
+        // MARK: Closing
+
+        /// Gives the line back as it was found and cancels the sources, whose cancel handlers close the
+        /// descriptor. Bytes still waiting are dropped. With `waitForOutput`, the driver gets a moment
+        /// to send what it already holds before the settings change under it.
+        func shutDown(waitForOutput: Bool) {
+            self.abandonWrites()
+            // The device may be gone, so a failure from here on is not worth reporting.
+            // Flow control goes off first: a stopped peer must not keep output from leaving.
+            Posix.clearFlowControl(self.descriptor)
+            if waitForOutput {
+                self.waitForOutputToLeave()
+            }
             var settings = self.originalSettings
             _ = Posix.tcsetattr(self.descriptor, TCSANOW, &settings)
             if self.exclusive {
@@ -198,15 +331,40 @@ extension PosixSerialPort {
                 _ = Posix.ioctl(self.descriptor, Posix.requestNonExclusive)
                 _ = Posix.lockFile(self.descriptor, LOCK_UN)
             }
+            self.cancelSources()
+        }
+
+        /// Waits, in short steps, until the driver holds no more output, but no longer than
+        /// `outputWaitLimit`. A driver that cannot say is not waited for.
+        private func waitForOutputToLeave() {
+            let deadline = DispatchTime.now().uptimeNanoseconds + Session.outputWaitLimit
+            while let queued = Posix.outputQueueLength(self.descriptor), queued > 0 {
+                if DispatchTime.now().uptimeNanoseconds >= deadline {
+                    return
+                }
+                Thread.sleep(forTimeInterval: Session.outputWaitSlice)
+            }
+        }
+
+        /// A source that is suspended runs no cancel handler and cannot be released: the read source
+        /// has never been resumed if the port closed before reading started, the write source is
+        /// suspended whenever nothing waits. Each is resumed before it is let go.
+        private func cancelSources() {
             if let source = self.readSource {
                 self.readSource = nil
-                source.cancel()
-                // A source that was never resumed does not run its cancel handler, and cannot be
-                // released.
                 if !self.isReading {
                     self.isReading = true
                     source.resume()
                 }
+                source.cancel()
+            }
+            if let source = self.writeSource {
+                self.writeSource = nil
+                if !self.isAwaitingRoom {
+                    self.isAwaitingRoom = true
+                    source.resume()
+                }
+                source.cancel()
             }
         }
     }
@@ -220,13 +378,18 @@ extension PosixSerialPort {
         _ = Posix.close(descriptor)
     }
 
+    /// Whether a failed write means the device went away, as a failed read does.
+    private static func deviceIsGone(afterWriteFailure code: Int32) -> Bool {
+        return code == EIO || code == ENXIO || code == ENODEV || code == EPIPE
+    }
+
     private func openOnQueue() -> OpenOutcome {
         if self.session != nil {
             return .alreadyOpen
         }
         let exclusive = self.configuration.exclusiveAccess
 
-        var flags = O_RDWR | O_NOCTTY | O_NONBLOCK
+        var flags = O_RDWR | O_NOCTTY | O_NONBLOCK | O_CLOEXEC
         #if canImport(Darwin)
         if exclusive {
             flags |= O_EXLOCK
@@ -242,18 +405,19 @@ extension PosixSerialPort {
         }
 
         #if !canImport(Darwin)
-        // Linux has no O_EXLOCK: take the lock after opening.
+        // Linux has no O_EXLOCK: take the lock after opening. Only a lock someone else holds refuses
+        // the open; if locking fails for another reason, the port carries on without the lock.
         if exclusive && Posix.lockFile(descriptor, LOCK_EX | LOCK_NB) != 0 {
-            _ = Posix.close(descriptor)
-            return .failed(.exclusiveAccessDenied(path: self.path))
+            let code = errno
+            if code == EWOULDBLOCK || code == EAGAIN {
+                _ = Posix.close(descriptor)
+                return .failed(.exclusiveAccessDenied(path: self.path))
+            }
         }
         #endif
         if exclusive {
             _ = Posix.ioctl(descriptor, Posix.requestExclusive)
         }
-
-        // Blocking I/O from here on.
-        _ = Posix.fcntl(descriptor, F_SETFL, 0)
 
         var original = termios()
         if Posix.tcgetattr(descriptor, &original) != 0 {
@@ -299,16 +463,22 @@ extension PosixSerialPort {
             originalSettings: original,
             exclusive: exclusive
         )
-        let source = DispatchSource.makeReadSource(fileDescriptor: descriptor, queue: self.executionQueue.queue)
-        source.setEventHandler { [weak self] in
+        let readSource = DispatchSource.makeReadSource(fileDescriptor: descriptor, queue: self.executionQueue.queue)
+        readSource.setEventHandler { [weak self] in
             self?.readAvailable(sessionNumber: number)
         }
-        let descriptorClosed = session.descriptorClosed
-        source.setCancelHandler {
-            _ = Posix.close(descriptor)
-            descriptorClosed.signal()
+        readSource.setCancelHandler {
+            session.sourceDidCancel()
         }
-        session.readSource = source
+        session.readSource = readSource
+        let writeSource = DispatchSource.makeWriteSource(fileDescriptor: descriptor, queue: self.executionQueue.queue)
+        writeSource.setEventHandler { [weak self] in
+            self?.roomToWrite(sessionNumber: number)
+        }
+        writeSource.setCancelHandler {
+            session.sourceDidCancel()
+        }
+        session.writeSource = writeSource
         self.session = session
         return .opened(session)
     }
@@ -322,12 +492,12 @@ extension PosixSerialPort {
 
     /// Marks the port closed and shuts the session down. Answers the semaphore that tells when the
     /// descriptor is closed, or `nil` when the port was not open.
-    private func tearDownOnQueue() -> DispatchSemaphore? {
+    private func tearDownOnQueue(waitForOutput: Bool) -> DispatchSemaphore? {
         guard let session = self.session else {
             return nil
         }
         self.session = nil
-        session.shutDown()
+        session.shutDown(waitForOutput: waitForOutput)
         return session.descriptorClosed
     }
 
@@ -336,7 +506,7 @@ extension PosixSerialPort {
         guard let session = self.session, session.number == sessionNumber else {
             return
         }
-        _ = self.tearDownOnQueue()
+        _ = self.tearDownOnQueue(waitForOutput: false)
         self.delegate?.streamDidClose(self, reason: reason)
     }
 
@@ -362,6 +532,7 @@ extension PosixSerialPort {
         }
         switch result.code {
         case EINTR, EAGAIN, EWOULDBLOCK:
+            // The descriptor is non-blocking: there was nothing to read after all.
             return
         case ENXIO, EIO, ENODEV:
             self.closeOnQueue(sessionNumber: sessionNumber, reason: .removed)
@@ -374,16 +545,35 @@ extension PosixSerialPort {
         guard let session = self.session else {
             return
         }
-        let descriptor = session.descriptor
-        let code = bytes.withUnsafeBytes { (raw: UnsafeRawBufferPointer) -> Int32 in
-            return Posix.writeAll(descriptor, raw)
-        }
+        let code = session.send(bytes)
         if code != 0 {
-            // The delegate never hears of a failure before `write` returns: close later.
-            let number = session.number
-            self.executionQueue.async {
-                self.closeOnQueue(sessionNumber: number, reason: .failed(.writeFailed(code: code)))
-            }
+            self.reportWriteFailure(of: session, code: code)
+        }
+    }
+
+    /// The write source says the device can take more.
+    private func roomToWrite(sessionNumber: Int) {
+        guard let session = self.session, session.number == sessionNumber else {
+            return
+        }
+        let code = session.drain()
+        if code != 0 {
+            self.reportWriteFailure(of: session, code: code)
+        }
+    }
+
+    private func reportWriteFailure(of session: Session, code: Int32) {
+        session.abandonWrites()
+        let reason: SerialCloseReason
+        if PosixSerialPort.deviceIsGone(afterWriteFailure: code) {
+            reason = .removed
+        } else {
+            reason = .failed(.writeFailed(code: code))
+        }
+        // The delegate never hears of a failure before `write` returns: close later.
+        let number = session.number
+        self.executionQueue.async {
+            self.closeOnQueue(sessionNumber: number, reason: reason)
         }
     }
 

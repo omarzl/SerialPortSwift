@@ -11,33 +11,35 @@ import Darwin
 import Glibc
 #endif
 
-#if !canImport(Darwin)
-// Swift's Glibc module does not import the pseudo-terminal calls, so they are declared by symbol.
-@_silgen_name("posix_openpt") fileprivate func glibcOpenPseudoTerminal(_ flags: Int32) -> Int32
-@_silgen_name("grantpt") fileprivate func glibcGrantPseudoTerminal(_ descriptor: Int32) -> Int32
-@_silgen_name("unlockpt") fileprivate func glibcUnlockPseudoTerminal(_ descriptor: Int32) -> Int32
-@_silgen_name("ptsname") fileprivate func glibcPseudoTerminalName(_ descriptor: Int32) -> UnsafeMutablePointer<CChar>?
-#endif
-
 /// The system calls the pseudo-terminal needs, under names that cannot be mistaken for its own
 /// `read`, `write` and `close`.
 private enum PseudoTerminalSystem {
+    #if canImport(Darwin)
     /// `ptsname` answers a buffer it owns, so concurrent callers take turns.
     private static let nameLock = NSLock()
+    #else
+    // Glibc imports neither of these: they are `_IOW` and `_IOR` macros. The numbers are the generic
+    // encoding, which x86-64 and arm64 use.
+    /// `TIOCSPTLCK`: lock or unlock the device side; takes an `int`.
+    private static let requestUnlock: UInt = 0x4004_5431
+    /// `TIOCGPTN`: the number of the device side; takes an `unsigned int`.
+    private static let requestNumber: UInt = 0x8004_5430
+    #endif
 
     static func openController(_ flags: Int32) -> Int32 {
         #if canImport(Darwin)
         return Darwin.posix_openpt(flags)
         #else
-        return glibcOpenPseudoTerminal(flags)
+        return Glibc.open("/dev/ptmx", flags)
         #endif
     }
 
+    /// Linux needs no `grantpt`: the device side belongs to the opener from the start.
     static func grant(_ descriptor: Int32) -> Int32 {
         #if canImport(Darwin)
         return Darwin.grantpt(descriptor)
         #else
-        return glibcGrantPseudoTerminal(descriptor)
+        return 0
         #endif
     }
 
@@ -45,23 +47,26 @@ private enum PseudoTerminalSystem {
         #if canImport(Darwin)
         return Darwin.unlockpt(descriptor)
         #else
-        return glibcUnlockPseudoTerminal(descriptor)
+        var unlocked: Int32 = 0
+        return Glibc.ioctl(descriptor, requestUnlock, &unlocked)
         #endif
     }
 
     static func deviceName(of descriptor: Int32) -> String? {
+        #if canImport(Darwin)
         nameLock.lock()
         defer { nameLock.unlock() }
-        #if canImport(Darwin)
         guard let name = Darwin.ptsname(descriptor) else {
             return nil
         }
+        return String(cString: name)
         #else
-        guard let name = glibcPseudoTerminalName(descriptor) else {
+        var number: UInt32 = 0
+        if Glibc.ioctl(descriptor, requestNumber, &number) != 0 {
             return nil
         }
+        return "/dev/pts/\(number)"
         #endif
-        return String(cString: name)
     }
 
     static func makeNonBlocking(_ descriptor: Int32) {
