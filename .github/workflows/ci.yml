@@ -1,0 +1,50 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  linux-swift-5_1:
+    name: Linux, Swift 5.1
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build and test with the oldest supported compiler
+        run: docker run --rm -v "$PWD:/src" -w /src swift:5.1 swift test --enable-test-discovery
+
+  linux-swift-6:
+    name: Linux, Swift 6.0
+    runs-on: ubuntu-latest
+    container: swift:6.0
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build and test
+        run: swift test
+
+  macos:
+    name: macOS
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Toolchain
+        run: swift --version
+      - name: Build and test
+        run: swift test
+      - name: Type-check against macOS 10.11
+        run: |
+          set -euo pipefail
+          SDK="$(xcrun --sdk macosx --show-sdk-path)"
+          OUT="$RUNNER_TEMP/modules"
+          mkdir -p "$OUT"
+          xcrun swiftc -parse-as-library -emit-module -module-name SerialPortSwift \
+            -target x86_64-apple-macosx10.11 -sdk "$SDK" \
+            -emit-module-path "$OUT/SerialPortSwift.swiftmodule" \
+            $(find Sources/SerialPortSwift -name '*.swift')
+          xcrun swiftc -parse-as-library -typecheck -module-name SerialPortSwiftSimulation \
+            -target x86_64-apple-macosx10.11 -sdk "$SDK" -I "$OUT" \
+            $(find Sources/SerialPortSwiftSimulation -name '*.swift')
