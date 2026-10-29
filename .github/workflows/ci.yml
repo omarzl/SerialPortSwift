@@ -48,3 +48,28 @@ jobs:
           xcrun swiftc -parse-as-library -typecheck -module-name SerialPortSwiftSimulation \
             -target x86_64-apple-macosx10.11 -sdk "$SDK" -I "$OUT" \
             $(find Sources/SerialPortSwiftSimulation -name '*.swift')
+
+  frameworks:
+    name: XCFrameworks (macOS 10.11)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Select Xcode
+        # The newest installed release Xcode that is not newer than the limit in Scripts/select-xcode.sh.
+        run: |
+          developer_dir="$(Scripts/select-xcode.sh)"
+          echo "DEVELOPER_DIR=$developer_dir" >> "$GITHUB_ENV"
+      - name: Install XcodeGen
+        run: brew install xcodegen
+      - name: Build, verify and zip the XCFrameworks
+        run: Scripts/build-xcframeworks.sh
+      - name: Upload the XCFrameworks
+        # The zips, not the folders: the symbolic links inside a framework do not survive an artifact upload.
+        uses: actions/upload-artifact@v5
+        with:
+          name: xcframeworks
+          path: |
+            build/xcframeworks/*.zip
+            build/xcframeworks/*.zip.sha256
+          compression-level: 0
+          if-no-files-found: error

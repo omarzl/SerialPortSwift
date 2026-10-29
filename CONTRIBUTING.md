@@ -58,3 +58,54 @@ To run the same check CI runs, with Docker:
 ```bash
 docker run --rm -v "$PWD:/src" -w /src swift:5.1 swift test --enable-test-discovery
 ```
+
+## Releases
+
+A release is a tag. Push a semantic version without a prefix:
+
+```bash
+git tag 1.2.3
+git push origin 1.2.3
+```
+
+Tags that are not `X.Y.Z` (such as `v1.2.3` or `1.2.3-rc1`) are ignored. SwiftPM resolves the same tag as
+the package version, so tag the commit you want to release.
+
+The `Release` workflow (`.github/workflows/release.yml`) builds the frameworks and creates the GitHub
+Release for the tag, if it does not exist yet. It uploads `SerialPortSwift.xcframework.zip` and
+`SerialPortSwiftSimulation.xcframework.zip`, each with a `.sha256` file that holds the checksum of the zip as
+`swift package compute-checksum` prints it (the value a SwiftPM `binaryTarget` asks for). The release notes list
+the same checksums. Running the workflow again replaces the files and leaves the notes alone.
+
+### Why prebuilt frameworks
+
+Xcode applies a deployment-target floor of macOS 10.13 to Swift packages it builds from source, so an app that
+deploys to macOS 10.11 cannot import the package through SwiftPM. An XCFramework built for macOS 10.11 has no such
+floor. `project.yml` describes the two frameworks for XcodeGen. CI generates the Xcode project from it and never
+commits it.
+
+Each framework is a universal binary. Its x86_64 slice requires macOS 10.11. Its arm64 slice requires macOS 11.0,
+the oldest system an Apple silicon Mac runs. Both are built with library evolution, so each carries a
+`.swiftinterface`.
+
+### Why Xcode 26.3 or older
+
+A `.swiftinterface` written by a newer compiler may not be readable by an older one, and the apps that use the
+frameworks build with Xcode 26.3. So the frameworks are built with an Xcode that is not newer than 26.3.
+`Scripts/select-xcode.sh` picks the newest installed release Xcode at or below that limit (betas are ignored) and
+fails if there is none. To raise the limit, change `MAX_XCODE_VERSION` in that script.
+
+### Building the frameworks locally
+
+You need macOS, an Xcode that is not newer than the limit, and XcodeGen (`brew install xcodegen`):
+
+```bash
+DEVELOPER_DIR="$(Scripts/select-xcode.sh)" Scripts/build-xcframeworks.sh
+```
+
+The script generates the project, archives both frameworks, packs the XCFrameworks and zips them, and writes
+everything to `build/xcframeworks/` (ignored by git). It fails if a binary lacks the arm64 or the x86_64 slice, if
+the x86_64 slice does not require macOS 10.11, or if a `.swiftinterface` is missing or does not name that target.
+It also refuses an Xcode newer than the limit unless you set `ALLOW_NEWER_XCODE=1`. Set `FRAMEWORK_VERSION=1.2.3` to
+stamp a version into the frameworks. The `frameworks` job in `ci.yml` runs the same script on every push and pull
+request and uploads the zips as the `xcframeworks` artifact.
