@@ -68,7 +68,9 @@ extension ReplyMatcher {
 /// The matcher most serial devices need: a reply is the last *n* units received, after setting aside
 /// the filler bytes some devices pad with.
 ///
-/// - `fillerBytes` are ignored when a candidate is measured, but stay in the reply delivered.
+/// - `fillerBytes` are ignored when a candidate is measured, but stay in the reply delivered when
+///   they sit inside it. A ``SerialRequestQueue`` scans after every byte, so its replies end at
+///   their last counted byte: filler in front of a reply or after it is not part of it.
 /// - With `requiresASCII`, a candidate holding any byte above `0x7F` (other than a filler byte) is
 ///   ``ReplyVerdict/unreadable``.
 /// - `lengthUnit` says what ``ReplyShape/exactly(_:)`` counts: bytes, or characters as Swift's

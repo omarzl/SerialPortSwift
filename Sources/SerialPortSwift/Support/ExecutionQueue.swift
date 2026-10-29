@@ -37,12 +37,12 @@ final class ExecutionQueue {
         if isCurrent {
             return try work()
         }
-        return try queue.sync(execute: work)
+        return try queue.sync { try work() }
     }
 
     /// Runs `work` here later, even when already here.
     func async(_ work: @escaping () -> Void) {
-        queue.async(execute: work)
+        queue.async { work() }
     }
 
     /// Runs `work` inline when already here, and later otherwise.
@@ -50,11 +50,11 @@ final class ExecutionQueue {
         if isCurrent {
             work()
         } else {
-            queue.async(execute: work)
+            queue.async { work() }
         }
     }
 
     func asyncAfter(_ delay: TimeInterval, _ work: @escaping () -> Void) {
-        queue.asyncAfter(deadline: .now() + delay, execute: work)
+        queue.asyncAfter(deadline: .now() + delay) { work() }
     }
 }
