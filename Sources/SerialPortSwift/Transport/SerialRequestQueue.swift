@@ -13,35 +13,41 @@ import Foundation
 /// exchange is written, then nothing else is written until it is answered or times out.
 ///
 /// **Replies.** Bytes received for the exchange on the wire are collected in a buffer of at most
-/// ``Configuration/maximumReplyLength`` bytes (the oldest byte goes first) and handed to the
-/// ``ReplyMatcher`` after every byte. The first reply it finds is delivered raw, the buffer is
-/// cleared and the next item is written. Bytes left over in the same chunk after a reply are
-/// dropped (``SerialQueueEvent/Kind/unsolicitedBytesDropped``): they arrived before the next frame
-/// was written, so they cannot answer it.
+/// ``Configuration/maximumReplyLength`` bytes (the oldest byte goes first; an exchange that expects
+/// `.exactly(n)` keeps at least `n`) and handed to the ``ReplyMatcher`` after every byte. The first
+/// reply it finds is delivered raw, the buffer is cleared and the next item is written. Bytes left
+/// over in the same chunk after a reply are dropped (``SerialQueueEvent/Kind/unsolicitedBytesDropped``):
+/// they arrived before the next frame was written, so they cannot answer it.
 ///
-/// **Timeouts.** An exchange's timer starts when its frame is written. When it fires, the delegate is
-/// told and the queue pauses for ``postTimeoutGap``: bytes that arrive in that pause are late for the
-/// exchange that timed out, and are published (``SerialQueueEvent/Kind/lateBytesDropped``) and
-/// dropped instead of being credited to the next one. Timers run on the queue's own serial queue, so
-/// a busy delivery queue cannot stretch them.
+/// **Timeouts.** An exchange's timer starts when its frame is handed to the stream, so it includes
+/// any time the stream takes to get earlier bytes out. When it fires, the delegate is told and the
+/// queue pauses for ``postTimeoutGap``: bytes that arrive in that pause are late for the exchange that
+/// timed out, and are published (``SerialQueueEvent/Kind/lateBytesDropped``) and dropped instead of
+/// being credited to the next one. Timers run on the queue's own serial queue, so a busy delivery
+/// queue cannot stretch them.
 ///
 /// **Unsolicited bytes.** Bytes that arrive with no exchange on the wire are published and dropped.
 ///
 /// **Closing.** `close()` stops the timer, drops everything queued and closes the stream. A close the
 /// stream reports on its own (unplugged, failed) does the same. Either way the delegate hears
 /// ``SerialTransportDelegate/transportDidClose(_:reason:)`` once, and nothing sent before the close
-/// is reported after it. Sending on a closed queue does nothing.
+/// is reported after it. Sending on a closed queue does nothing. A `close()` that comes before the
+/// stream has finished opening closes the queue at once, as a stream that is not open yet has
+/// nothing to report; if the stream opens after all, the queue closes it again.
 ///
 /// **Threads.** All state lives on one private serial queue. Delegate calls arrive on
 /// ``Configuration/deliveryQueue``. When `open()` or `close()` is called on the delivery queue and the
-/// stream reports synchronously, the delegate is told before the call returns. Observers
-/// (``SerialQueueObserver``) are called on the serial queue. Call `open()` and `close()` from any
-/// thread but the queue's own.
+/// stream reports synchronously, the delegate is told before the call returns.
+/// ``SerialTransportDelegate/transportDidOpen(_:)`` is dropped if the queue has closed by the time it
+/// would be delivered. Observers (``SerialQueueObserver``) are called on the serial queue. Call
+/// `open()` and `close()` from any thread but the queue's own.
 public final class SerialRequestQueue: SerialTransport {
     public struct Configuration {
         /// The timeout of an exchange that does not carry its own.
         public var defaultTimeout: TimeInterval
-        /// The most bytes kept while waiting for a reply; older bytes are dropped first.
+        /// The most bytes kept while waiting for a reply; older bytes are dropped first. An exchange
+        /// that expects `.exactly(n)` keeps at least `n` bytes even when `n` is larger, so its reply
+        /// can still be found.
         public var maximumReplyLength: Int
         /// The pause after a timeout during which late bytes are dropped. `0` for none.
         public var postTimeoutGap: TimeInterval
@@ -178,16 +184,23 @@ public final class SerialRequestQueue: SerialTransport {
     }
 
     public func close() {
-        let shouldClose = serial.sync { () -> Bool in
+        let started = serial.sync { () -> (session: Int, wasOpening: Bool)? in
             guard self.connection != .closed && self.connection != .closing else {
-                return false
+                return nil
             }
+            let wasOpening = self.connection == .opening
             self.connection = .closing
             self.endSession()
-            return true
+            return (self.generation, wasOpening)
         }
-        if shouldClose {
-            stream.close()
+        guard let closing = started else {
+            return
+        }
+        stream.close()
+        if closing.wasOpening {
+            // A stream that is not open yet reports nothing for `close()`. If it did not report, this
+            // close is complete now; if it opens late, `streamDidOpen` closes it again.
+            finishClose(.requested, onlyIfStillClosing: closing.session)
         }
     }
 
@@ -341,7 +354,11 @@ public final class SerialRequestQueue: SerialTransport {
             publish(.unsolicitedBytesDropped, bytes: chunk)
             return
         }
-        let limit = max(1, configuration.maximumReplyLength)
+        var limit = max(1, configuration.maximumReplyLength)
+        if case .exactly(let length) = flight.exchange.reply {
+            // The reply cannot be found if it does not fit in the buffer.
+            limit = max(limit, length)
+        }
         let bytes = Array(chunk)
         for (position, byte) in bytes.enumerated() {
             replyBuffer.append(byte)
@@ -374,31 +391,63 @@ public final class SerialRequestQueue: SerialTransport {
 
     // MARK: - Stream events
 
+    private enum OpenOutcome {
+        /// The queue is open now; `session` names the session that opened.
+        case opened(session: Int)
+        /// The queue was closed (or closing) when the stream opened: it is closed again.
+        case closeAgain
+        case ignored
+    }
+
     private func streamDidOpen() {
-        let opened = serial.sync { () -> Bool in
-            guard self.connection == .opening else {
-                return false
+        let outcome = serial.sync { () -> OpenOutcome in
+            switch self.connection {
+            case .opening:
+                self.connection = .open
+                self.publish(.opened)
+                return .opened(session: self.generation)
+            case .closed, .closing:
+                return .closeAgain
+            case .open:
+                return .ignored
             }
-            self.connection = .open
-            self.publish(.opened)
-            return true
         }
-        guard opened else {
+        switch outcome {
+        case .ignored:
             return
-        }
-        delivery.run { [weak self] in
-            if let self = self, let delegate = self.delegate {
-                delegate.transportDidOpen(self)
+        case .closeAgain:
+            // The close overtook the open. Whatever the stream reports for this is ignored.
+            stream.close()
+        case .opened(let session):
+            delivery.run { [weak self] in
+                guard let self = self else {
+                    return
+                }
+                // A close may have been delivered ahead of this call: the delegate must not hear of
+                // an open that is over.
+                let stillOpen = self.serial.sync { self.generation == session && self.connection == .open }
+                if stillOpen, let delegate = self.delegate {
+                    delegate.transportDidOpen(self)
+                }
             }
-        }
-        serial.async {
-            self.pump()
+            serial.async {
+                self.pump()
+            }
         }
     }
 
     private func streamDidClose(_ reason: SerialCloseReason) {
+        finishClose(reason, onlyIfStillClosing: nil)
+    }
+
+    /// Closes the queue, publishes it and tells the delegate, unless it is closed already. With
+    /// `session` set, only if the close of that session is still waiting for the stream's report.
+    private func finishClose(_ reason: SerialCloseReason, onlyIfStillClosing session: Int?) {
         let waiters = serial.sync { () -> [() -> Void]? in
             guard self.connection != .closed else {
+                return nil
+            }
+            if let session = session, self.connection != .closing || self.generation != session {
                 return nil
             }
             self.connection = .closed

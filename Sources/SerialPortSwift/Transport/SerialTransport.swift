@@ -19,7 +19,7 @@ public struct SerialExchangeID: Hashable {
 public enum ReplyShape: Equatable {
     /// Exactly this many units, as the ``ReplyMatcher`` counts them.
     case exactly(Int)
-    /// Whatever arrives first.
+    /// The first byte that arrives.
     case anything
 }
 
@@ -31,6 +31,8 @@ public struct SerialExchange {
     /// What the reply looks like.
     public let reply: ReplyShape
     /// How long to wait for the reply, or `nil` for the transport's ``SerialTransport/defaultTimeout``.
+    /// The time runs from the moment the frame is handed to the stream, so it includes any time the
+    /// stream takes to get earlier bytes out.
     public let timeout: TimeInterval?
 
     public init(id: SerialExchangeID, frame: Data, reply: ReplyShape, timeout: TimeInterval? = nil) {
@@ -48,7 +50,8 @@ public struct SerialExchange {
 /// a different driver, so an app talks to one protocol whichever driver is behind it.
 ///
 /// Delegate calls arrive on the transport's delivery queue (the main queue unless configured
-/// otherwise).
+/// otherwise). Set `delegate` before calling `open()`: what the transport reports while it has no
+/// delegate is lost.
 public protocol SerialTransport: AnyObject {
     var name: String { get }
     var isOpen: Bool { get }
@@ -77,6 +80,12 @@ public protocol SerialTransportDelegate: AnyObject {
     /// `reply` is the raw bytes that satisfied the exchange's ``ReplyShape``, exactly as received.
     func transport(_ transport: SerialTransport, didAnswer exchange: SerialExchange, with reply: Data)
     func transport(_ transport: SerialTransport, didTimeOut exchange: SerialExchange)
-    /// A problem the transport survived: it is still open.
+    /// A problem the transport survived: it is still open. A transport that wraps another driver
+    /// uses it to pass on that driver's errors; ``SerialRequestQueue`` never calls it. Optional:
+    /// the default implementation does nothing.
     func transport(_ transport: SerialTransport, didEncounter error: SerialStreamError)
+}
+
+extension SerialTransportDelegate {
+    public func transport(_ transport: SerialTransport, didEncounter error: SerialStreamError) {}
 }

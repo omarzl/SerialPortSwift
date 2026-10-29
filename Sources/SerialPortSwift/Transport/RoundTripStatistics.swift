@@ -28,17 +28,17 @@ public struct RoundTripSummary: Equatable {
 ///
 /// A value type with no locking: keep it on one thread.
 public struct RoundTripStatistics<Key: Hashable> {
-    /// How many of the most recent round trips each key keeps.
+    /// How many of the most recent round trips each key keeps; at least 1.
     public let windowSize: Int
 
     private var windows: [Key: RoundTripWindow] = [:]
 
     public init(windowSize: Int = 1000) {
-        self.windowSize = windowSize
+        self.windowSize = max(1, windowSize)
     }
 
     public mutating func record(_ roundTrip: TimeInterval, for key: Key) {
-        windows[key, default: RoundTripWindow()].append(roundTrip, keeping: max(1, windowSize))
+        windows[key, default: RoundTripWindow()].append(roundTrip, keeping: windowSize)
     }
 
     /// The summary of `key`'s window, or `nil` when nothing was recorded for it.

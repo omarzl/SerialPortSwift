@@ -16,8 +16,8 @@ public struct SerialQueueEvent: Equatable {
         case sent(SerialExchangeID?)
         /// A chunk the stream delivered, exactly as received, before anything decides what it is.
         case raw
-        /// An exchange was answered. `bytes` is the reply; `roundTrip` runs from the write to the
-        /// reply's last byte.
+        /// An exchange was answered. `bytes` is the reply; `roundTrip` runs from handing the frame to
+        /// the stream to the reply's last byte.
         case answered(SerialExchangeID, roundTrip: TimeInterval)
         /// An exchange's reply did not arrive in time. `bytes` is the frame that was sent.
         case timedOut(SerialExchangeID)

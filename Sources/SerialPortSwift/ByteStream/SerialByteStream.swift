@@ -9,6 +9,8 @@ import Foundation
 /// frames — a TCP connection could implement it. It knows nothing about requests and replies;
 /// ``SerialRequestQueue`` adds those on top of any stream.
 ///
+/// Set `delegate` before calling `open()`: what a stream reports while it has no delegate is lost.
+///
 /// Every implementation keeps this threading contract:
 ///
 /// - `open()` and `close()` may report their outcome synchronously, on the caller's thread, before
@@ -17,10 +19,12 @@ import Foundation
 /// - `write(_:)` may be called from any thread, writes the bytes in the order it was given them, and
 ///   never calls the delegate before it returns: a failed write is reported later, on the stream's
 ///   own queue.
-/// - `stream(_:didReceive:)`, and a close the stream did not ask for (`.removed`, `.failed`), are
-///   reported on the stream's own queue, in order.
-/// - Opening an open stream, or closing a closed one, does nothing and reports nothing. Writing to a
-///   closed stream does nothing.
+/// - `stream(_:didReceive:)` is reported on the stream's own queue, in order. So is a close the
+///   stream did not ask for (`.removed`, `.failed`), unless it is the direct result of a call, as
+///   when a simulated device is unplugged: that close may be reported synchronously from the call
+///   that caused it.
+/// - Opening an open stream, or closing a closed one, does nothing and reports nothing; closing a
+///   stream that is not open yet reports nothing either. Writing to a closed stream does nothing.
 public protocol SerialByteStream: AnyObject {
     /// A short name for logs and for people: `usbserial-1420`, `simulated`.
     var name: String { get }

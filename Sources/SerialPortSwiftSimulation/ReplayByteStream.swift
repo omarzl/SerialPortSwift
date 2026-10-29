@@ -64,21 +64,38 @@ public struct ReplayWrite: Equatable {
 /// with the script used up is recorded and gets no answer. Bytes and closes the script does not tie
 /// to a write are pushed with ``receive(_:after:)`` and ``end(_:after:)``.
 ///
-/// Open and close report synchronously, before they return.
+/// Open and close report synchronously, before they return. Nothing is delivered once a close has
+/// been decided, and a write still queued when the stream closes is lost, even if the stream is
+/// opened again before the script would have seen it.
+///
+/// Chunks are delivered with a lock held that `close()` waits for, so a delegate must not wait for
+/// another thread that is closing the stream.
 public final class ReplayByteStream: SerialByteStream {
     public let name: String
     public weak var delegate: SerialByteStreamDelegate?
+
+    /// What a scheduled item does when its moment comes.
+    private enum Action {
+        case deliver(Data)
+        case end(SerialCloseReason)
+    }
 
     /// Something to do at a moment, in order of `due` and then of `sequence`.
     private struct Scheduled {
         let due: UInt64
         let sequence: Int
         let generation: Int
-        let action: () -> Void
+        let action: Action
     }
 
     private let openFailure: SerialStreamError?
     private let queue: DispatchQueue
+
+    /// Held while a chunk is delivered, from the check that the stream is still open to the end of the
+    /// delegate call, and while a close is decided. So nothing is delivered after a close has been
+    /// decided. Recursive, so a delegate may close the stream from inside a delivery. Always taken
+    /// before `lock`.
+    private let deliveryLock = NSRecursiveLock()
 
     // The state below is guarded by `lock`, which is never held while calling the delegate.
     private let lock = NSLock()
@@ -120,11 +137,7 @@ public final class ReplayByteStream: SerialByteStream {
     /// the stream is closed by then.
     public func receive(_ bytes: Data, after delay: TimeInterval = 0) {
         lock.lock()
-        let item = insert(at: ReplayByteStream.now() &+ ReplayByteStream.nanoseconds(delay)) { [weak self] in
-            if let self = self {
-                self.delegate?.stream(self, didReceive: bytes)
-            }
-        }
+        let item = insert(at: ReplayByteStream.now() &+ ReplayByteStream.nanoseconds(delay), .deliver(bytes))
         lock.unlock()
         arm(item)
     }
@@ -132,11 +145,7 @@ public final class ReplayByteStream: SerialByteStream {
     /// Closes the stream `delay` seconds from now, as if the device did it: reported with `reason`.
     public func end(_ reason: SerialCloseReason, after delay: TimeInterval = 0) {
         lock.lock()
-        let item = insert(at: ReplayByteStream.now() &+ ReplayByteStream.nanoseconds(delay)) { [weak self] in
-            if let self = self {
-                self.finish(with: reason)
-            }
-        }
+        let item = insert(at: ReplayByteStream.now() &+ ReplayByteStream.nanoseconds(delay), .end(reason))
         lock.unlock()
         arm(item)
     }
@@ -174,37 +183,54 @@ public final class ReplayByteStream: SerialByteStream {
     }
 
     public func close() {
-        finish(with: .requested)
+        finish(with: .requested, session: nil)
     }
 
     public func write(_ bytes: Data) {
+        // The session is named here, on the caller's thread: a write that is still queued when the
+        // stream closes belongs to a session that is over, whatever happens to the stream after.
+        lock.lock()
+        let isOpen = opened
+        let writeGeneration = generation
+        lock.unlock()
+        guard isOpen else {
+            return
+        }
         queue.async { [weak self] in
-            self?.record(bytes)
+            self?.record(bytes, generation: writeGeneration)
         }
     }
 
     // MARK: - Private
 
     /// Closes the stream, cancels everything still on its way and reports `reason` — unless it is
-    /// closed already.
-    private func finish(with reason: SerialCloseReason) {
+    /// closed already, or `session` is set and is not the one that is open. The decision is made with
+    /// the delivery lock held, so no chunk is being delivered and none will be; the report itself is
+    /// made without it.
+    private func finish(with reason: SerialCloseReason, session: Int?) {
+        deliveryLock.lock()
         lock.lock()
-        let wasOpen = opened
-        if wasOpen {
+        var closes = opened
+        if let session = session, session != generation {
+            closes = false
+        }
+        if closes {
             opened = false
             generation += 1
             scheduled.removeAll()
         }
         lock.unlock()
-        if wasOpen {
+        deliveryLock.unlock()
+        if closes {
             delegate?.streamDidClose(self, reason: reason)
         }
     }
 
-    /// Notes a write and schedules the replies of the step it uses up. Runs on `queue`.
-    private func record(_ bytes: Data) {
+    /// Notes a write and schedules the replies of the step it uses up. Runs on `queue`. A write from a
+    /// session that is over is dropped.
+    private func record(_ bytes: Data, generation writeGeneration: Int) {
         lock.lock()
-        guard opened else {
+        guard opened && generation == writeGeneration else {
             lock.unlock()
             return
         }
@@ -220,11 +246,7 @@ public final class ReplayByteStream: SerialByteStream {
         var items: [Scheduled] = []
         for reply in replies {
             let due = arrival &+ ReplayByteStream.nanoseconds(reply.offset)
-            items.append(insert(at: due) { [weak self] in
-                if let self = self {
-                    self.delegate?.stream(self, didReceive: reply.bytes)
-                }
-            })
+            items.append(insert(at: due, .deliver(reply.bytes)))
         }
         lock.unlock()
         for item in items {
@@ -234,7 +256,7 @@ public final class ReplayByteStream: SerialByteStream {
 
     /// Notes that `action` is due at `due`, ahead of anything due later. Call with `lock` held, then
     /// `arm` the result once it is released.
-    private func insert(at due: UInt64, _ action: @escaping () -> Void) -> Scheduled {
+    private func insert(at due: UInt64, _ action: Action) -> Scheduled {
         nextSequence += 1
         let item = Scheduled(due: due, sequence: nextSequence, generation: generation, action: action)
         let position = scheduled.firstIndex { ReplayByteStream.isBefore(item, $0) } ?? scheduled.count
@@ -260,11 +282,26 @@ public final class ReplayByteStream: SerialByteStream {
                 return
             }
             scheduled.removeFirst()
-            let current = opened && next.generation == generation
+            lock.unlock()
+            perform(next)
+        }
+    }
+
+    private func perform(_ item: Scheduled) {
+        switch item.action {
+        case .deliver(let bytes):
+            // The delivery lock is held from the check to the end of the call, so a close cannot be
+            // decided in between.
+            deliveryLock.lock()
+            defer { deliveryLock.unlock() }
+            lock.lock()
+            let current = opened && item.generation == generation
             lock.unlock()
             if current {
-                next.action()
+                delegate?.stream(self, didReceive: bytes)
             }
+        case .end(let reason):
+            finish(with: reason, session: item.generation)
         }
     }
 

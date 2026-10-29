@@ -71,6 +71,21 @@ final class TailScanMatcherTests: XCTestCase {
         XCTAssertEqual(matcher.verdict(on: data("a\r\n"), expecting: .exactly(2)), .accepted)
     }
 
+    func testBytesIgnoreFillerAndStillFlagNonASCIIOutsideIt() {
+        let matcher = TailScanMatcher(fillerBytes: [0xFF], requiresASCII: true)
+
+        XCTAssertEqual(matcher.verdict(on: Data([0xFF, 0x41, 0xFF, 0x42]), expecting: .exactly(2)), .accepted)
+        XCTAssertEqual(matcher.verdict(on: Data([0xFF, 0x41, 0xFF, 0x42]), expecting: .exactly(4)), .rejected)
+        XCTAssertEqual(matcher.verdict(on: Data([0xFF, 0x41, 0x80]), expecting: .exactly(2)), .unreadable)
+    }
+
+    func testCharactersAreCountedAfterTheFillerIsTakenOut() {
+        // The filler is taken out before the characters are counted, so "\r" 0xFF "\n" is "\r\n".
+        let matcher = TailScanMatcher(fillerBytes: [0xFF], lengthUnit: .characters)
+
+        XCTAssertEqual(matcher.verdict(on: Data([0x0D, 0xFF, 0x0A]), expecting: .exactly(1)), .accepted)
+    }
+
     func testBytesCountCRLFAsTwo() {
         let matcher = TailScanMatcher(lengthUnit: .bytes)
 
@@ -176,6 +191,24 @@ final class TailScanMatcherTests: XCTestCase {
         XCTAssertEqual(slice, Data([0x5A, 0x43]))
     }
 
+    func testAUnreadableCandidateFromASliceIsRebasedToo() {
+        let parent = Data([0x58, 0x41, 0x80, 0x42])
+
+        let scan = padded.scan(parent[1...], expecting: .exactly(9))
+
+        XCTAssertNil(scan.packet)
+        XCTAssertEqual(scan.unreadable, Data([0x41, 0x80, 0x42]))
+        XCTAssertEqual(scan.unreadable?.startIndex, 0)
+    }
+
+    func testVerdictsOnTheTailsOfASliceCountTheirOwnBytes() {
+        let parent = Data([0x58, 0xFF, 0x41, 0xFF, 0x42])
+
+        let scan = padded.scan(parent[1...], expecting: .exactly(2))
+
+        XCTAssertEqual(scan.packet, Data([0x41, 0xFF, 0x42]))
+    }
+
     func testAPacketFromASliceIsRebased() {
         let parent = Data([0x58, 0x59, 0x5A, 0x43])
 
@@ -213,8 +246,37 @@ final class TailScanMatcherTests: XCTestCase {
         let scan = matcher.scan(Data([1, 2, 3, 4, 5]), expecting: .anything)
 
         XCTAssertEqual(scan.packet, Data([3, 4, 5]))
+        XCTAssertEqual(scan.packet?.startIndex, 0)
         XCTAssertEqual(seen.candidates, [Data([5]), Data([4, 5]), Data([3, 4, 5])])
-        XCTAssertTrue(seen.candidates.allSatisfy { $0.startIndex == 0 })
+    }
+
+    func testTheDefaultScanHandsTheTailsToTheVerdictAsSlicesOfTheBuffer() {
+        let seen = SeenCandidates()
+        let matcher = RecordingMatcher(rule: { _ in .rejected }, seen: seen)
+
+        _ = matcher.scan(Data([1, 2, 3, 4]), expecting: .anything)
+
+        // Not copies: each tail keeps its place in the buffer.
+        XCTAssertEqual(seen.candidates.map { $0.startIndex }, [3, 2, 1, 0])
+        XCTAssertTrue(seen.candidates.allSatisfy { $0.endIndex == 4 })
+    }
+
+    func testTheDefaultScanOfASliceTriesTheTailsOfThatSlice() {
+        let seen = SeenCandidates()
+        let matcher = RecordingMatcher(rule: { $0.count == 2 ? .accepted : .rejected }, seen: seen)
+
+        let scan = matcher.scan(Data([1, 2, 3, 4, 5])[2...], expecting: .anything)
+
+        XCTAssertEqual(scan.packet, Data([4, 5]))
+        XCTAssertEqual(seen.candidates, [Data([5]), Data([4, 5])])
+    }
+
+    func testTheDefaultScanOfAnEmptyBufferAsksNoOne() {
+        let seen = SeenCandidates()
+        let matcher = RecordingMatcher(rule: { _ in .accepted }, seen: seen)
+
+        XCTAssertEqual(matcher.scan(Data(), expecting: .anything), ReplyScan(packet: nil, unreadable: nil))
+        XCTAssertEqual(seen.candidates, [])
     }
 
     func testTheDefaultScanReportsTheLongestUnreadableTailBeforeTheAcceptedOne() {

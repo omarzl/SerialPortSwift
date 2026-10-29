@@ -85,6 +85,19 @@ final class RoundTripStatisticsTests: XCTestCase {
         XCTAssertEqual(statistics.summary(for: "read"), RoundTripSummary(count: 1, total: 2, median: 2, p99: 2))
     }
 
+    func testAWindowSizeBelowOneIsReportedAsOne() {
+        XCTAssertEqual(RoundTripStatistics<String>(windowSize: 0).windowSize, 1)
+        XCTAssertEqual(RoundTripStatistics<String>(windowSize: -5).windowSize, 1)
+        XCTAssertEqual(RoundTripStatistics<String>(windowSize: 7).windowSize, 7)
+        XCTAssertEqual(RoundTripStatistics<String>().windowSize, 1000)
+
+        var statistics = RoundTripStatistics<String>(windowSize: 0)
+        statistics.record(1, for: "read")
+        statistics.record(2, for: "read")
+
+        XCTAssertEqual(statistics.summary(for: "read"), RoundTripSummary(count: 1, total: 2, median: 2, p99: 2))
+    }
+
     func testKeysAreKeptApart() {
         var statistics = RoundTripStatistics<String>()
         statistics.record(1, for: "read")

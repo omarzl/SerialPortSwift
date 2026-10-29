@@ -193,8 +193,13 @@
                 guard let descriptor = SerialPortMonitor.descriptor(of: service) else {
                     return
                 }
+                // A service that publishes again under an entry ID already listed is not a new
+                // connection: its description is refreshed, and the delegate is not told again.
+                let isNew = self.portsByEntryID[entryID] == nil
                 self.portsByEntryID[entryID] = descriptor
-                connected.append(descriptor)
+                if isNew {
+                    connected.append(descriptor)
+                }
             }
 
             if reportsToDelegate && !connected.isEmpty {

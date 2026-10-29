@@ -259,6 +259,22 @@ private final class ManualByteStream: SerialByteStream {
     private var opens = 0
     private var closes = 0
     private var written: [Data] = []
+    private var report: SerialCloseReason?
+
+    /// When set, `close()` reports this before it returns, as the streams in the package do for a stream
+    /// that is open. By default it reports nothing: the test calls `completeClose` itself.
+    var closeReport: SerialCloseReason? {
+        get {
+            lock.lock()
+            defer { lock.unlock() }
+            return report
+        }
+        set {
+            lock.lock()
+            report = newValue
+            lock.unlock()
+        }
+    }
 
     var openCalls: Int {
         lock.lock()
@@ -287,7 +303,11 @@ private final class ManualByteStream: SerialByteStream {
     func close() {
         lock.lock()
         closes += 1
+        let reason = report
         lock.unlock()
+        if let reason = reason {
+            delegate?.streamDidClose(self, reason: reason)
+        }
     }
 
     func write(_ bytes: Data) {
@@ -307,6 +327,74 @@ private final class ManualByteStream: SerialByteStream {
     func completeClose(_ reason: SerialCloseReason) {
         delegate?.streamDidClose(self, reason: reason)
     }
+}
+
+/// A stream whose `open()` waits for the test before it finishes, the way a slow open does: a `close()`
+/// from another thread can overtake it. It reports like the streams in the package: a close only if it
+/// was open.
+private final class LateOpeningStream: SerialByteStream {
+    let name = "late"
+    weak var delegate: SerialByteStreamDelegate?
+
+    private let lock = NSLock()
+    private var opened = false
+    private let entered = DispatchSemaphore(value: 0)
+    private let release = DispatchSemaphore(value: 0)
+
+    var isOpen: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return opened
+    }
+
+    /// Waits until `open()` has been called and is waiting.
+    func waitUntilOpenIsWaiting() -> Bool {
+        return entered.wait(timeout: .now() + 10) == .success
+    }
+
+    /// Lets the waiting `open()` finish.
+    func finishOpening() {
+        release.signal()
+    }
+
+    func open() {
+        entered.signal()
+        _ = release.wait(timeout: .now() + 10)
+        lock.lock()
+        let wasOpen = opened
+        opened = true
+        lock.unlock()
+        if !wasOpen {
+            delegate?.streamDidOpen(self)
+        }
+    }
+
+    func close() {
+        lock.lock()
+        let wasOpen = opened
+        opened = false
+        lock.unlock()
+        if wasOpen {
+            delegate?.streamDidClose(self, reason: .requested)
+        }
+    }
+
+    func write(_ bytes: Data) {}
+}
+
+/// A device that never answers.
+private final class SilentDevice: SerialDeviceSimulator {
+    func reply(to frame: Data) -> Data? {
+        return nil
+    }
+}
+
+/// A delegate that implements only what the protocol requires.
+private final class MinimalDelegate: SerialTransportDelegate {
+    func transportDidOpen(_ transport: SerialTransport) {}
+    func transportDidClose(_ transport: SerialTransport, reason: SerialCloseReason) {}
+    func transport(_ transport: SerialTransport, didAnswer exchange: SerialExchange, with reply: Data) {}
+    func transport(_ transport: SerialTransport, didTimeOut exchange: SerialExchange) {}
 }
 
 /// A queue over a replay stream, with a delegate and an observer attached.
@@ -700,6 +788,38 @@ final class SerialRequestQueueTests: XCTestCase {
         XCTAssertEqual(rig.delegate.calls, [.opened, .answered(1, Data([0x41, 0xFF, 0x42]))])
     }
 
+    func testCharactersFindAReplyAtItsCarriageReturnAndTheLineFeedArrivesWithNothingInFlight() {
+        let matcher = TailScanMatcher(lengthUnit: .characters)
+        let rig = Rig(
+            script: [.reply(with: [ReplayChunk(ascii("OK\r"), at: 0.02), ReplayChunk(ascii("\n"), at: 0.1)])],
+            matcher: matcher
+        )
+        rig.queue.open()
+
+        rig.queue.send(exchange(1, "q", reply: .exactly(3)))
+        waitUntil { rig.observer.has(.unsolicited) }
+
+        XCTAssertEqual(rig.delegate.calls, [.opened, .answered(1, ascii("OK\r"))])
+        XCTAssertEqual(rig.observer.firstEvent(.unsolicited)?.bytes, ascii("\n"))
+        XCTAssertEqual(rig.observer.tagsWithoutRaw, [.opened, .sent(1), .answered(1), .unsolicited])
+    }
+
+    func testBytesTakeTheWholeCarriageReturnLineFeedEnding() {
+        let matcher = TailScanMatcher(lengthUnit: .bytes)
+        let rig = Rig(
+            script: [.reply(with: [ReplayChunk(ascii("OK\r"), at: 0.02), ReplayChunk(ascii("\n"), at: 0.1)])],
+            matcher: matcher
+        )
+        rig.queue.open()
+
+        rig.queue.send(exchange(1, "q", reply: .exactly(4)))
+        waitUntil { rig.delegate.calls.count == 2 }
+        settle(0.1)
+
+        XCTAssertEqual(rig.delegate.calls, [.opened, .answered(1, ascii("OK\r\n"))])
+        XCTAssertFalse(rig.observer.has(.unsolicited))
+    }
+
     func testANonASCIIByteIsPublishedAsAnUnreadableCandidate() {
         let rig = Rig(script: [.silence()], matcher: paddedMatcher)
         rig.queue.open()
@@ -724,7 +844,7 @@ final class SerialRequestQueueTests: XCTestCase {
         let log = ScanLog()
         let rig = Rig(script: [.silence()], matcher: LoggingMatcher(log: log), maximumReplyLength: 4)
         rig.queue.open()
-        rig.queue.send(exchange(1, "q", reply: .exactly(9)))
+        rig.queue.send(exchange(1, "q", reply: .exactly(3)))
         waitUntil { rig.observer.has(.sent(1)) }
 
         rig.stream.receive(Data([1, 2, 3, 4, 5, 6]))
@@ -737,6 +857,50 @@ final class SerialRequestQueueTests: XCTestCase {
         ])
         XCTAssertTrue(log.buffers.allSatisfy { $0.count <= 4 })
         XCTAssertTrue(log.startIndexes.allSatisfy { $0 == 0 })
+    }
+
+    func testAnExactLengthLongerThanTheLimitKeepsEnoughBytesToBeFound() {
+        let log = ScanLog()
+        let rig = Rig(script: [.silence()], matcher: LoggingMatcher(log: log), maximumReplyLength: 4)
+        rig.queue.open()
+        rig.queue.send(exchange(1, "q", reply: .exactly(6)))
+        waitUntil { rig.observer.has(.sent(1)) }
+
+        rig.stream.receive(Data([1, 2, 3, 4, 5, 6, 7, 8]))
+        waitUntil { log.buffers.count == 8 }
+
+        XCTAssertEqual(log.buffers, [
+            Data([1]), Data([1, 2]), Data([1, 2, 3]), Data([1, 2, 3, 4]), Data([1, 2, 3, 4, 5]),
+            Data([1, 2, 3, 4, 5, 6]), Data([2, 3, 4, 5, 6, 7]), Data([3, 4, 5, 6, 7, 8])
+        ])
+    }
+
+    func testAnExchangeThatExpectsMoreThanTheDefaultLimitIsAnswered() {
+        let reply = Data((0..<100).map { UInt8($0) })
+        let rig = Rig(script: [
+            .reply(with: [ReplayChunk(reply.prefix(60), at: 0.02), ReplayChunk(reply.suffix(40), at: 0.04)])
+        ])
+        XCTAssertEqual(rig.queue.configuration.maximumReplyLength, 64)
+        rig.queue.open()
+
+        rig.queue.send(exchange(1, "q", reply: .exactly(100)))
+        waitUntil { rig.delegate.calls.count == 2 }
+
+        XCTAssertEqual(rig.delegate.calls, [.opened, .answered(1, reply)])
+        XCTAssertEqual(rig.observer.tagsWithoutRaw, [.opened, .sent(1), .answered(1)])
+    }
+
+    func testTheLimitStillAppliesToExchangesThatNeedLess() {
+        let log = ScanLog()
+        let rig = Rig(script: [.silence()], matcher: LoggingMatcher(log: log), maximumReplyLength: 4)
+        rig.queue.open()
+        rig.queue.send(exchange(1, "q", reply: .anything))
+        waitUntil { rig.observer.has(.sent(1)) }
+
+        rig.stream.receive(Data([1, 2, 3, 4, 5, 6]))
+        waitUntil { log.buffers.count == 6 }
+
+        XCTAssertTrue(log.buffers.allSatisfy { $0.count <= 4 })
     }
 
     func testTheBufferStartsEmptyForEachExchange() {
@@ -1083,27 +1247,273 @@ final class SerialRequestQueueTests: XCTestCase {
         XCTAssertEqual(manual.writes, [ascii("1"), ascii("w")])
     }
 
-    func testClosingWhileOpeningClosesOnceAndIgnoresALateOpen() {
+    func testClosingWhileOpeningClosesAtOnceAsTheStreamHasNothingToReport() {
         let manual = ManualByteStream()
+        let queue = SerialRequestQueue(stream: manual)
+        let delegate = TransportSpy()
+        let observer = ObserverSpy()
+        queue.delegate = delegate
+        queue.addObserver(observer)
+        queue.open()
+
+        queue.close()
+
+        XCTAssertEqual(manual.openCalls, 1)
+        XCTAssertEqual(manual.closeCalls, 1)
+        XCTAssertEqual(delegate.calls, [.closed(.requested)])
+        XCTAssertEqual(observer.tags, [.closed(.requested)])
+        XCTAssertFalse(queue.isOpen)
+
+        // The queue is not stuck: it opens again.
+        queue.open()
+        XCTAssertEqual(manual.openCalls, 2)
+        manual.completeOpen()
+        XCTAssertEqual(delegate.calls, [.closed(.requested), .opened])
+        XCTAssertTrue(queue.isOpen)
+    }
+
+    func testClosingWhileOpeningReportsOnceWhenTheStreamReportsTheCloseToo() {
+        let manual = ManualByteStream()
+        manual.closeReport = .requested
         let queue = SerialRequestQueue(stream: manual)
         let delegate = TransportSpy()
         queue.delegate = delegate
         queue.open()
 
         queue.close()
+        manual.completeClose(.requested)
+
+        XCTAssertEqual(delegate.calls, [.closed(.requested)])
+        XCTAssertFalse(queue.isOpen)
+    }
+
+    func testAnOpenThatCompletesAfterTheQueueWasClosedClosesTheStreamAgain() {
+        let manual = ManualByteStream()
+        let queue = SerialRequestQueue(stream: manual)
+        let delegate = TransportSpy()
+        queue.delegate = delegate
         queue.open()
-        XCTAssertEqual(manual.openCalls, 1)
-        XCTAssertEqual(manual.closeCalls, 1)
+        queue.close()
+
         manual.completeOpen()
-        XCTAssertEqual(delegate.calls, [])
+
+        XCTAssertEqual(manual.closeCalls, 2)
+        XCTAssertEqual(delegate.calls, [.closed(.requested)])
         XCTAssertFalse(queue.isOpen)
 
+        // What the stream reports for that second close changes nothing.
         manual.completeClose(.requested)
-        manual.completeClose(.removed)
-
         XCTAssertEqual(delegate.calls, [.closed(.requested)])
         queue.open()
         XCTAssertEqual(manual.openCalls, 2)
+    }
+
+    func testAnOpenThatCompletesWhileTheQueueIsClosingClosesTheStreamAgain() {
+        let manual = ManualByteStream()
+        let queue = SerialRequestQueue(stream: manual)
+        let delegate = TransportSpy()
+        queue.delegate = delegate
+        queue.open()
+        manual.completeOpen()
+        queue.close()
+        XCTAssertEqual(delegate.calls, [.opened])
+
+        manual.completeOpen()
+
+        XCTAssertEqual(manual.closeCalls, 2)
+        XCTAssertEqual(delegate.calls, [.opened])
+        manual.completeClose(.requested)
+        manual.completeClose(.requested)
+        XCTAssertEqual(delegate.calls, [.opened, .closed(.requested)])
+        XCTAssertFalse(queue.isOpen)
+    }
+
+    func testAnOpenReportedTwiceOpensTheQueueOnce() {
+        let manual = ManualByteStream()
+        let queue = SerialRequestQueue(stream: manual)
+        let delegate = TransportSpy()
+        queue.delegate = delegate
+        queue.open()
+
+        manual.completeOpen()
+        manual.completeOpen()
+        settle(0.05)
+
+        XCTAssertEqual(delegate.calls, [.opened])
+        XCTAssertEqual(manual.closeCalls, 0)
+        XCTAssertTrue(queue.isOpen)
+    }
+
+    func testClosingWhileOpeningRunsTheIdleWorkWaitingOnTheQueue() {
+        let manual = ManualByteStream()
+        let queue = SerialRequestQueue(stream: manual)
+        queue.open()
+        queue.send(exchange(1, "1"))
+        var ran = false
+        queue.whenIdle { ran = true }
+        settle(0.05)
+        XCTAssertFalse(ran)
+
+        queue.close()
+
+        waitUntil { ran }
+    }
+
+    func testACloseThatOvertakesASlowOpenOnAnotherThreadLeavesTheQueueClosedAndUsable() {
+        let slow = LateOpeningStream()
+        let queue = SerialRequestQueue(stream: slow)
+        let delegate = TransportSpy()
+        queue.delegate = delegate
+        let opened = expectation(description: "open returned")
+        DispatchQueue.global().async {
+            queue.open()
+            opened.fulfill()
+        }
+        XCTAssertTrue(slow.waitUntilOpenIsWaiting())
+
+        queue.close()
+        XCTAssertEqual(delegate.calls, [.closed(.requested)])
+
+        slow.finishOpening()
+        wait(for: [opened], timeout: 10)
+
+        // The stream opened after all: the queue closed it again and did not report it.
+        XCTAssertFalse(slow.isOpen)
+        XCTAssertFalse(queue.isOpen)
+        settle(0.05)
+        XCTAssertEqual(delegate.calls, [.closed(.requested)])
+
+        slow.finishOpening()
+        queue.open()
+        XCTAssertTrue(queue.isOpen)
+        XCTAssertTrue(slow.isOpen)
+        XCTAssertEqual(delegate.calls, [.closed(.requested), .opened])
+    }
+
+    func testOpeningAndClosingFromTwoThreadsNeverLeavesTheQueueStuck() {
+        let group = DispatchGroup()
+        let delivery = DispatchQueue(label: "SerialRequestQueueTests.twoThreads")
+        for iteration in 0..<300 {
+            let stream = SimulatedByteStream(device: SilentDevice(), replyLatency: 0)
+            let queue = SerialRequestQueue(
+                stream: stream,
+                configuration: SerialRequestQueue.Configuration(deliveryQueue: delivery)
+            )
+            let delegate = TransportSpy()
+            queue.delegate = delegate
+            let start = DispatchSemaphore(value: 0)
+            DispatchQueue.global().async(group: group) {
+                start.wait()
+                queue.open()
+            }
+            DispatchQueue.global().async(group: group) {
+                start.wait()
+                queue.close()
+            }
+            start.signal()
+            start.signal()
+            XCTAssertEqual(group.wait(timeout: .now() + 10), .success)
+
+            queue.close()
+            XCTAssertFalse(queue.isOpen, "iteration \(iteration)")
+            XCTAssertFalse(stream.isOpen, "iteration \(iteration)")
+            queue.open()
+            XCTAssertTrue(queue.isOpen, "iteration \(iteration)")
+            queue.close()
+        }
+    }
+
+    // MARK: Order of open and close for the delegate
+
+    func testAnOpenWaitingForTheDeliveryQueueIsDroppedWhenACloseWasDeliveredAheadOfIt() {
+        let manual = ManualByteStream()
+        manual.closeReport = .requested
+        let delivery = DispatchQueue(label: "SerialRequestQueueTests.openDelivery")
+        let queue = SerialRequestQueue(
+            stream: manual,
+            configuration: SerialRequestQueue.Configuration(deliveryQueue: delivery)
+        )
+        let delegate = TransportSpy()
+        queue.delegate = delegate
+        queue.open()
+        let busy = DispatchSemaphore(value: 0)
+        let proceed = DispatchSemaphore(value: 0)
+        delivery.async {
+            busy.signal()
+            _ = proceed.wait(timeout: .now() + 10)
+            // On the delivery queue, so the close is delivered at once, ahead of the open below.
+            queue.close()
+        }
+        XCTAssertEqual(busy.wait(timeout: .now() + 10), .success)
+
+        manual.completeOpen()
+        proceed.signal()
+        delivery.sync {}
+
+        XCTAssertEqual(delegate.calls, [.closed(.requested)])
+        XCTAssertFalse(queue.isOpen)
+    }
+
+    func testAnOpenWaitingForTheDeliveryQueueIsDroppedWhenTheQueueWasClosedAndOpenedAgain() {
+        let manual = ManualByteStream()
+        manual.closeReport = .requested
+        let delivery = DispatchQueue(label: "SerialRequestQueueTests.openDelivery")
+        let queue = SerialRequestQueue(
+            stream: manual,
+            configuration: SerialRequestQueue.Configuration(deliveryQueue: delivery)
+        )
+        let delegate = TransportSpy()
+        queue.delegate = delegate
+        queue.open()
+        let busy = DispatchSemaphore(value: 0)
+        let proceed = DispatchSemaphore(value: 0)
+        delivery.async {
+            busy.signal()
+            _ = proceed.wait(timeout: .now() + 10)
+            queue.close()
+            queue.open()
+            manual.completeOpen()
+        }
+        XCTAssertEqual(busy.wait(timeout: .now() + 10), .success)
+
+        manual.completeOpen()
+        proceed.signal()
+        delivery.sync {}
+
+        // The first open is over: the delegate hears of the second one only.
+        XCTAssertEqual(delegate.calls, [.closed(.requested), .opened])
+        XCTAssertTrue(queue.isOpen)
+    }
+
+    func testAnOpenIsStillDeliveredWhenNothingClosedTheQueueMeanwhile() {
+        let manual = ManualByteStream()
+        let delivery = DispatchQueue(label: "SerialRequestQueueTests.openDelivery")
+        let queue = SerialRequestQueue(
+            stream: manual,
+            configuration: SerialRequestQueue.Configuration(deliveryQueue: delivery)
+        )
+        let delegate = TransportSpy()
+        queue.delegate = delegate
+        queue.open()
+
+        manual.completeOpen()
+        delivery.sync {}
+
+        XCTAssertEqual(delegate.calls, [.opened])
+    }
+
+    // MARK: Delegates
+
+    func testADelegateNeedNotImplementDidEncounterAndOneThatDoesStillHearsIt() {
+        let rig = Rig()
+        let minimal = MinimalDelegate()
+        let asProtocol: SerialTransportDelegate = minimal
+
+        asProtocol.transport(rig.queue, didEncounter: .readFailed(code: 5))
+
+        let spy: SerialTransportDelegate = rig.delegate
+        spy.transport(rig.queue, didEncounter: .readFailed(code: 5))
+        XCTAssertEqual(rig.delegate.calls, [.encountered(.readFailed(code: 5))])
     }
 
     // MARK: Sending on a closed queue
