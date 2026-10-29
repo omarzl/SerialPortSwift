@@ -90,8 +90,8 @@ the oldest system an Apple silicon Mac runs. Both are built with library evoluti
 
 ### Why Xcode 26.3 or older
 
-A `.swiftinterface` written by a newer compiler may not be readable by an older one, and the apps that use the
-frameworks build with Xcode 26.3. So the frameworks are built with an Xcode that is not newer than 26.3.
+A `.swiftinterface` written by a newer compiler may not be readable by an older one. So that apps building with
+Xcode 26.3 can import them, the frameworks are built with an Xcode that is not newer than 26.3.
 `Scripts/select-xcode.sh` picks the newest installed release Xcode at or below that limit (betas are ignored) and
 fails if there is none. To raise the limit, change `MAX_XCODE_VERSION` in that script.
 
