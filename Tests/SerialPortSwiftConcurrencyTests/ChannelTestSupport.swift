@@ -6,7 +6,7 @@
 //  its events), a stream the test drives by hand, and the waits a test needs.
 //
 
-#if compiler(>=5.5) && canImport(_Concurrency)
+#if compiler(>=5.7) && canImport(_Concurrency)
 
     import Foundation
     import SerialPortSwift
@@ -89,6 +89,13 @@
                 lock.unlock()
             }
         }
+
+        /// Changes the value in one step, so that tasks that change it at once lose none of the changes.
+        func mutate(_ change: (inout Value) -> Void) {
+            lock.lock()
+            change(&stored)
+            lock.unlock()
+        }
     }
 
     // MARK: - What the channel keeps, for the tests
@@ -105,13 +112,31 @@
         return await channel.eventConsumerCount
     }
 
-    /// Waits until `channel` has `count` consumers of its events. The streams of Swift 5.5 do not always
-    /// report a consumer that stopped, so a compiler older than 5.7 does not wait.
+    /// Waits until `channel` has `count` consumers of its events.
     @available(macOS 10.15, *)
     func waitForEventConsumers(_ count: Int, of channel: SerialChannel) async {
-        #if compiler(>=5.7)
-            await waitUntil { await eventConsumerCount(of: channel) == count }
-        #endif
+        await waitUntil { await eventConsumerCount(of: channel) == count }
+    }
+
+    /// How many calls of `channel.waitUntilIdle()` are still waiting.
+    @available(macOS 10.15, *)
+    func idleWaiterCount(of channel: SerialChannel) async -> Int {
+        return await channel.idleWaiterCount
+    }
+
+    /// Fires the timer of the exchange that `token` names, as its task would when it runs out: a token that
+    /// names no exchange on the wire is a timer that is late, and must change nothing. The first exchange a
+    /// channel writes has token 1, the second 2, and so on.
+    @available(macOS 10.15, *)
+    func fireTimeout(_ token: Int, of channel: SerialChannel) async {
+        await channel.timeoutFired(token)
+    }
+
+    /// Ends the pause that `token` names, as its task would when it runs out. The first pause a channel
+    /// starts has token 1, the second 2, and so on.
+    @available(macOS 10.15, *)
+    func endPause(_ token: Int, of channel: SerialChannel) async {
+        await channel.gapEnded(token)
     }
 
     // MARK: - Waiting
@@ -368,7 +393,8 @@
     /// A stream the test drives by hand, to hold the channel in the states a synchronous stream skips.
     /// By default `open()` and `close()` report nothing and the test calls `completeOpen` and
     /// `completeClose` itself; `closeReport` makes `close()` report before it returns, as the streams
-    /// in the package do for a stream that is open.
+    /// in the package do for a stream that is open. `onWrite` runs with every frame written, on the thread
+    /// that writes it: the channel's actor, when the channel does.
     final class ManualByteStream: SerialByteStream, @unchecked Sendable {
         let name = "manual"
         weak var delegate: SerialByteStreamDelegate?
@@ -378,6 +404,20 @@
         private var closes = 0
         private var written: [Data] = []
         private var report: SerialCloseReason?
+        private var writeHook: (@Sendable (Data) -> Void)?
+
+        var onWrite: (@Sendable (Data) -> Void)? {
+            get {
+                lock.lock()
+                defer { lock.unlock() }
+                return writeHook
+            }
+            set {
+                lock.lock()
+                writeHook = newValue
+                lock.unlock()
+            }
+        }
 
         var closeReport: SerialCloseReason? {
             get {
@@ -429,7 +469,9 @@
         func write(_ bytes: Data) {
             lock.lock()
             written.append(bytes)
+            let hook = writeHook
             lock.unlock()
+            hook?(bytes)
         }
 
         func completeOpen() {
@@ -471,6 +513,27 @@
         }
     }
 
+    /// A matcher that runs `hook` at every scan, then scans as the default `TailScanMatcher` does. The channel
+    /// scans on its actor, so the hook runs where the channel's own work does: nothing else on the channel
+    /// moves until it returns, which lets a test do something at a moment that is otherwise a race.
+    struct HookedMatcher: ReplyMatcher {
+        let hook: @Sendable () -> Void
+        private let inner = TailScanMatcher()
+
+        init(_ hook: @escaping @Sendable () -> Void) {
+            self.hook = hook
+        }
+
+        func verdict(on candidate: Data, expecting shape: ReplyShape) -> ReplyVerdict {
+            return inner.verdict(on: candidate, expecting: shape)
+        }
+
+        func scan(_ buffer: Data, expecting shape: ReplyShape) -> ReplyScan {
+            hook()
+            return inner.scan(buffer, expecting: shape)
+        }
+    }
+
     struct LoggingMatcher: ReplyMatcher {
         let log: ScanLog
 
@@ -504,9 +567,10 @@
         let channel: SerialChannel
         let recorder: EventRecorder
 
-        init(defaultTimeout: TimeInterval = 5, gap: TimeInterval = 0) async {
+        init(matcher: ReplyMatcher = TailScanMatcher(), defaultTimeout: TimeInterval = 5, gap: TimeInterval = 0) async {
             channel = SerialChannel(
                 stream: stream,
+                matcher: matcher,
                 configuration: SerialChannel.Configuration(defaultTimeout: defaultTimeout, postTimeoutGap: gap)
             )
             recorder = await EventRecorder.attach(to: channel)

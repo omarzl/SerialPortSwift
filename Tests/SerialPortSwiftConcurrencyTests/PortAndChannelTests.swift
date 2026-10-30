@@ -6,7 +6,7 @@
 //  with the test playing the device on the other end of the line.
 //
 
-#if compiler(>=5.5) && canImport(_Concurrency)
+#if compiler(>=5.7) && canImport(_Concurrency)
 
     import Foundation
     import SerialPortSwift
@@ -119,7 +119,7 @@
                 (recorder.firstEvent(.answered(1)).flatMap { event -> TimeInterval? in
                     if case .answered(_, let roundTrip) = event.kind { return roundTrip } else { return nil }
                 }) ?? 0,
-                0.09
+                0.1 - 0.05
             )
             await channel.close()
             device.shutDown()

@@ -43,13 +43,24 @@ deploying to macOS 10.11 cannot load. Code that uses concurrency links it, so `S
 `SerialPortSwiftSimulation` must never use it, and the `async`/`await` engine lives in its own product that an app
 opts into. An app that stays on `SerialPortSwift` never links the concurrency runtime.
 
-**Its minimums.** It needs the Swift 5.5 compiler and macOS 10.15:
+**Its minimums.** It needs the Swift 5.7 compiler and macOS 10.15:
 
-- All of its code is inside `#if compiler(>=5.5) && canImport(_Concurrency)`, and its public types are
-  `@available(macOS 10.15, *)`. With an older compiler the target builds empty, so the Swift 5.1 job keeps passing.
+- All of its code, and all of its tests, are inside `#if compiler(>=5.7) && canImport(_Concurrency)`, and its public
+  types are `@available(macOS 10.15, *)`. With an older compiler the target builds empty, so the Swift 5.1 job keeps
+  passing.
 - Its framework is built with a deployment target of macOS 10.15 (`project.yml`). The other two stay at 10.11.
-- It must build without warnings with every Swift from 5.5 on. Newer APIs go behind `#if compiler(>=...)`.
+- It must build without warnings with every Swift from 5.7 on. The `Linux, Swift 5.7` job builds it with
+  `-warnings-as-errors` with the 5.7 compiler and runs its tests, so "builds clean from the minimum" is checked, not
+  assumed. Newer APIs go behind `#if compiler(>=...)`.
 - The Swift 5.1 list above does not apply to it. Everything else in this file does.
+
+**Why Swift 5.7 and not 5.5.** Swift 5.5 is where `async`/`await` starts, but its concurrency runtime loses a
+wake-up: a task that makes a channel, takes a stream from `events()`, opens the channel and closes it never gets past
+`events()`: the `await` on the actor never returns. It was reproduced with the `swift:5.5` image on Linux,
+where the loop stalled in its first round, and it does not happen with 5.7 or later. A channel that can hang its
+caller is worse than none, so the minimum is the oldest compiler whose runtime passes that loop, which is
+`testChannelsWithAnEventsConsumerCanBeReleasedAndMadeAgainInQuickSuccession`. Do not lower it without checking that
+test on the runtime you lower it to.
 
 **No continuation wrappers.** The channel is written with native concurrency only: actors, `AsyncStream`, `Task`.
 `withCheckedContinuation`, `withCheckedThrowingContinuation`, `withUnsafeContinuation` and

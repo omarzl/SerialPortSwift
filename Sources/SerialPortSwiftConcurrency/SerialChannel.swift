@@ -11,7 +11,7 @@
 //  worlds.
 //
 
-#if compiler(>=5.5) && canImport(_Concurrency)
+#if compiler(>=5.7) && canImport(_Concurrency)
 
     import Foundation
     import SerialPortSwift
@@ -45,15 +45,32 @@
     ///   ``postTimeoutGap``; bytes that arrive in that pause are dropped, never credited to the next
     ///   request. Timers are `Task.sleep`, so a busy main thread cannot stretch them.
     /// - **Cancellation.** Cancelling the task of a request that is still waiting its turn takes it out
-    ///   of the queue, and the request throws `CancellationError`. A request already on the wire is
-    ///   left to its reply or its timeout — the device answers it either way — and returns or throws as
-    ///   usual.
+    ///   of the queue, and the request throws `CancellationError`. Once `cancel()` has returned, such a
+    ///   request is not written, even if the exchange ahead of it is answered at that moment. A request
+    ///   already on the wire is left to its reply or its timeout — the device answers it either way — and
+    ///   returns or throws as usual.
     /// - **Closing.** ``close()`` and a close the stream reports on its own (the device removed, a
     ///   failure) end every request still waiting or on the wire with
     ///   ``SerialChannelError/closed(_:)``.
     ///
-    /// The stream it is given becomes the channel's: the channel is its delegate. Give it a stream that is
-    /// not open yet; opening it is ``open()``'s job.
+    /// **What differs from the queue.**
+    ///
+    /// - A request made while the channel is still opening throws ``SerialChannelError/notOpen``; the
+    ///   queue keeps it until the stream has opened.
+    /// - Bytes the stream delivers while the channel is opening produce no events; the queue publishes
+    ///   them as raw and drops them as unsolicited.
+    /// - There is no bulk cancel like ``SerialRequestQueue/cancelQueuedExchanges()``: cancel the tasks of
+    ///   the requests.
+    ///
+    /// **The stream.** It becomes the channel's: the channel is its delegate, and it must be opened and
+    /// closed only through the channel, never by calling `open()` or `close()` on the stream itself. The
+    /// channel ends its own session before it asks the stream to close, so a close the stream reports as
+    /// ``SerialCloseReason/requested`` is taken for the echo of that call, whenever it arrives, and
+    /// ignored. Give the channel a stream that is not open yet; opening it is ``open()``'s job.
+    ///
+    /// ``open()`` and ``close()`` call the stream's own `open()` and `close()` from the actor. A stream
+    /// that blocks there — a port that drains its output before it closes — holds the channel for that
+    /// long: nothing else on the channel makes progress meanwhile.
     @available(macOS 10.15, *)
     public actor SerialChannel {
         public struct Configuration: Sendable {
@@ -74,6 +91,11 @@
         /// The stream's name, for logs and people.
         public nonisolated let name: String
 
+        /// The configuration the channel was made with; read the timeout of a request that carries none
+        /// as `configuration.defaultTimeout`. The pause after a timeout can change while the channel
+        /// runs, and ``postTimeoutGap`` is its current value.
+        public nonisolated let configuration: Configuration
+
         // MARK: State
 
         private enum Connection {
@@ -88,17 +110,22 @@
         }
 
         /// A request or a write waiting its turn. `outcome` is how the actor tells its caller what became
-        /// of it; `number` names it for a cancellation.
+        /// of it; `number` names it for a cancellation, and `cancellation` is raised, at the moment the
+        /// caller's task is cancelled, before the actor has heard of it.
         private struct Queued {
             let number: Int
             let work: Work
             let outcome: AsyncStream<Outcome>.Continuation
+            let cancellation: CancelFlag
         }
 
         /// The exchange whose frame was written and whose reply is awaited. `token` names its timer.
+        /// `mark` is how many reports the stream had posted when the frame was written: a chunk numbered
+        /// at most `mark` was posted before the frame and cannot be its reply.
         private struct OnTheWire {
             let exchange: SerialExchange
             let writtenAt: UInt64
+            let mark: Int
             let token: Int
             let timer: Task<Void, Never>
             let outcome: AsyncStream<Outcome>.Continuation
@@ -111,7 +138,6 @@
 
         private let stream: SerialByteStream
         private let matcher: ReplyMatcher
-        private let configuration: Configuration
         private let bridge: StreamBridge
 
         private var connection = Connection.closed
@@ -126,6 +152,9 @@
         private var inGap = false
         private var gapTimer: Task<Void, Never>?
         private var gapToken = 0
+        /// How many reports the stream had posted when the last pause ended: a chunk numbered at most this
+        /// was posted during the pause, however late the actor hears of it, and is late.
+        private var gapMark = 0
         private var timeoutToken = 0
         private var nextTicket = 0
         private var nextExchange = 0
@@ -166,6 +195,9 @@
         ///
         /// A stream that opens asynchronously is waited for. A task cancelled meanwhile still waits: it is
         /// ``close()`` that ends an open that never completes, with `.closed(.requested)`.
+        ///
+        /// The stream's own `open()` is called from the actor, so a stream that blocks in it holds the
+        /// channel until it returns.
         public func open() async throws {
             let outcomes: AsyncStream<OpenOutcome>
             switch connection {
@@ -191,6 +223,9 @@
 
         /// Closes the stream. Every request still waiting or on the wire throws
         /// ``SerialChannelError/closed(_:)`` with `.requested`. Closing a closed channel does nothing.
+        ///
+        /// The stream's own `close()` is called from the actor, so a stream that blocks in it — a port that
+        /// drains its output first — holds the channel until it returns.
         public func close() async {
             guard connection != .closed else {
                 return
@@ -227,7 +262,10 @@
             }
         }
 
-        /// A request whose id the channel picks.
+        /// A request whose id the channel picks. The ids count from 1 on each channel, and the channel does
+        /// not look at the ids you give to `request(_:)`, so on one channel the two can be the same: the
+        /// events then name two exchanges by one id. Use one form on a channel, or number your own
+        /// exchanges apart from the small numbers.
         public func request(_ frame: Data, reply: ReplyShape, timeout: TimeInterval? = nil) async throws -> Data {
             nextExchange += 1
             let exchange = SerialExchange(id: SerialExchangeID(number: nextExchange), frame: frame, reply: reply, timeout: timeout)
@@ -257,7 +295,8 @@
         }
 
         /// Returns once nothing is queued and nothing is on the wire — at once if that is already so,
-        /// or if the channel is closed.
+        /// or if the channel is closed. It also returns at once when its task is cancelled, whether or not
+        /// the channel is idle: a cancelled task does not wait.
         public func waitUntilIdle() async {
             if connection == .closed || isIdle {
                 return
@@ -286,6 +325,10 @@
         /// A request taken out of the queue by a cancellation is published as `.cancelled`, as
         /// ``SerialRequestQueue/cancelQueuedExchanges()`` does; a write without a reply has no id and
         /// publishes nothing.
+        ///
+        /// A stream buffers without limit. A consumer that stops iterating but neither cancels its task nor
+        /// leaves the loop leaves its stream growing with every event until the channel is released: end
+        /// a stream you no longer read.
         public func events() -> AsyncStream<SerialQueueEvent> {
             let (events, continuation) = makeMailbox(SerialQueueEvent.self)
             let id = eventHub.add(continuation)
@@ -310,6 +353,11 @@
             return eventHub.count
         }
 
+        /// How many calls of ``waitUntilIdle()`` are waiting.
+        var idleWaiterCount: Int {
+            return idleWaiters.count
+        }
+
         // MARK: Queueing
 
         /// Nothing queued and nothing on the wire.
@@ -320,27 +368,31 @@
         private func enqueue(_ work: Work) -> Ticket {
             nextTicket += 1
             let (outcomes, continuation) = makeMailbox(Outcome.self)
-            queued.append(Queued(number: nextTicket, work: work, outcome: continuation))
+            let cancellation = CancelFlag()
+            queued.append(Queued(number: nextTicket, work: work, outcome: continuation, cancellation: cancellation))
             drainQueue()
-            return Ticket(number: nextTicket, outcomes: outcomes)
+            return Ticket(number: nextTicket, outcomes: outcomes, cancellation: cancellation)
         }
 
         /// What became of a request or a write.
         ///
         /// The caller waits in a task of its own, one that its cancellation does not reach: a stream ends
         /// its iteration as soon as the task consuming it is cancelled, and a request on the wire is left
-        /// to its reply. The cancellation handler takes the request out of the queue if it is still there.
+        /// to its reply.
+        ///
+        /// The cancellation handler runs on the thread that cancels, so all it does at once is raise the
+        /// ticket's flag, which `drainQueue` looks at before it writes anything: when `cancel()` returns,
+        /// the request will not be written. Taking it out of the queue, and waking whoever waits for the
+        /// channel to be idle, needs the actor, so the handler asks it to.
         private func outcome(of ticket: Ticket) async -> Outcome {
             let number = ticket.number
             let waiter = firstValue(of: ticket.outcomes, orElse: .closed(.requested))
+            let cancellation = ticket.cancellation
             let cancel: @Sendable () -> Void = { [self] in
+                cancellation.raise()
                 Task { await self.cancelQueued(number) }
             }
-            #if compiler(>=5.7)
-                return await withTaskCancellationHandler(operation: { await waiter.value }, onCancel: cancel)
-            #else
-                return await withTaskCancellationHandler(handler: cancel, operation: { await waiter.value })
-            #endif
+            return await withTaskCancellationHandler(operation: { await waiter.value }, onCancel: cancel)
         }
 
         /// Takes the request or write out of the queue if it is still waiting its turn.
@@ -348,20 +400,30 @@
             guard let index = queued.firstIndex(where: { $0.number == number }) else {
                 return
             }
-            let item = queued.remove(at: index)
+            withdraw(queued.remove(at: index))
+            if connection == .open && isIdle {
+                resumeIdleWaiters()
+            }
+        }
+
+        /// Ends a request or write that was cancelled before its turn: its caller throws `CancellationError`,
+        /// and an exchange is published as `.cancelled`.
+        private func withdraw(_ item: Queued) {
             if case .exchange(let exchange) = item.work {
                 publish(.cancelled([exchange.id]))
             }
             resolve(item.outcome, .cancelled)
-            if connection == .open && isIdle {
-                resumeIdleWaiters()
-            }
         }
 
         /// Writes what is next in line, until an exchange is on the wire or the line is empty.
         private func drainQueue() {
             while connection == .open && onTheWire == nil && !inGap && !queued.isEmpty {
                 let item = queued.removeFirst()
+                if item.cancellation.isRaised {
+                    // Cancelled while it waited, before `cancelQueued` could take it out: it is not written.
+                    withdraw(item)
+                    continue
+                }
                 switch item.work {
                 case .write(let frame):
                     stream.write(frame)
@@ -369,6 +431,8 @@
                     resolve(item.outcome, .written)
                 case .exchange(let exchange):
                     replyBuffer = Data()
+                    // Whatever the stream has posted by now was received before this frame went out.
+                    let mark = bridge.posted
                     stream.write(exchange.frame)
                     let writtenAt = DispatchTime.now().uptimeNanoseconds
                     timeoutToken += 1
@@ -378,7 +442,7 @@
                     let timer = startTimer(untilUptime: deadline) {
                         await owner.object?.timeoutFired(token)
                     }
-                    onTheWire = OnTheWire(exchange: exchange, writtenAt: writtenAt, token: token, timer: timer, outcome: item.outcome)
+                    onTheWire = OnTheWire(exchange: exchange, writtenAt: writtenAt, mark: mark, token: token, timer: timer, outcome: item.outcome)
                     publish(.sent(exchange.id), bytes: exchange.frame)
                 }
             }
@@ -387,7 +451,10 @@
             }
         }
 
-        private func timeoutFired(_ token: Int) {
+        /// The timer that `token` names has run out. The token is all that ties a timer to its exchange, so a
+        /// timer that is late — its exchange answered, closed or replaced — finds another token and does
+        /// nothing. Not private, so that a test can fire a timer that is stale.
+        func timeoutFired(_ token: Int) {
             guard let flight = onTheWire, flight.token == token, connection == .open else {
                 return
             }
@@ -412,27 +479,37 @@
             }
         }
 
-        private func gapEnded(_ token: Int) {
+        /// The pause that `token` names is over. As with `timeoutFired`, a stale token does nothing, and the
+        /// function is not private for the same reason.
+        func gapEnded(_ token: Int) {
             guard inGap, gapToken == token else {
                 return
             }
             inGap = false
             gapTimer = nil
+            // Whatever the stream has posted by now arrived during the pause, even if the actor hears of it
+            // only after it.
+            gapMark = bridge.posted
             drainQueue()
         }
 
         // MARK: Receiving
 
-        private func process(_ chunk: Data, arrivedAt date: Date, monotonic: UInt64) {
+        /// `sequence` is the chunk's number among what the stream reported. The stream and the actor are two
+        /// places, so a chunk can be posted before something the actor does and be heard of after it. What
+        /// tells whether it came first is its number, never the moment the actor hears of it, and never a
+        /// clock.
+        private func process(_ chunk: Data, arrivedAt date: Date, monotonic: UInt64, sequence: Int) {
             guard connection == .open else {
                 return
             }
             publish(.raw, bytes: chunk, date: date)
-            if inGap {
+            if inGap || sequence <= gapMark {
                 publish(.lateBytesDropped, bytes: chunk)
                 return
             }
-            guard let flight = onTheWire else {
+            guard let flight = onTheWire, sequence > flight.mark else {
+                // Nothing is on the wire, or the chunk arrived before the frame that is: it answers nothing.
                 publish(.unsolicitedBytesDropped, bytes: chunk)
                 return
             }
@@ -487,10 +564,14 @@
                 streamDidOpen()
             case .received(let chunk, let date, let monotonic):
                 if stamped.generation == generation {
-                    process(chunk, arrivedAt: date, monotonic: monotonic)
+                    process(chunk, arrivedAt: date, monotonic: monotonic, sequence: stamped.sequence)
                 }
             case .closed(let reason):
-                if stamped.generation == generation {
+                // The channel ends its session before it asks the stream to close, so a close reported as
+                // `.requested` is the echo of that call, whenever the stream makes it: if it comes late
+                // enough, it carries the number of a session that began after. Only the channel closes its
+                // stream.
+                if stamped.generation == generation && reason != .requested {
                     streamDidClose(reason)
                 }
             }
@@ -667,8 +748,7 @@
         }
     }
 
-    /// A weak reference a `@Sendable` closure can hold: the compilers before 5.7 take a closure that captures
-    /// `weak var` for one that is not sendable.
+    /// A weak reference a `@Sendable` closure can hold.
     @available(macOS 10.15, *)
     private final class WeakChannel: @unchecked Sendable {
         weak var object: SerialChannel?
@@ -692,6 +772,27 @@
     private struct Ticket: @unchecked Sendable {
         let number: Int
         let outcomes: AsyncStream<Outcome>
+        let cancellation: CancelFlag
+    }
+
+    /// Raised by the cancellation of a request's task, on the thread that cancels it, and read by the actor
+    /// before it writes the request. The one thing about a cancellation the actor need not be asked for.
+    @available(macOS 10.15, *)
+    private final class CancelFlag: @unchecked Sendable {
+        private let lock = NSLock()
+        private var raised = false
+
+        var isRaised: Bool {
+            lock.lock()
+            defer { lock.unlock() }
+            return raised
+        }
+
+        func raise() {
+            lock.lock()
+            raised = true
+            lock.unlock()
+        }
     }
 
     /// A stream, and the continuation that feeds it: how the actor hands a value to someone who waits for it.
@@ -723,11 +824,15 @@
     // The tasks below outlive the call that starts them and hold the channel only weakly, so they are made here,
     // outside the actor, and not in one of its methods: a task made there would run on the actor as its executor,
     // an actor it does not keep alive. They go through the channel only while they use it.
+    //
+    // Each has a priority of its own. A task made by a plain `Task { }` takes the priority of whoever makes it,
+    // and the channel would run its pump and its timers at that of the first caller to open it or to make a
+    // request, which may be a background task.
 
     /// Runs `fire` when the uptime clock reaches `deadline`, unless the task it returns is cancelled first.
     @available(macOS 10.15, *)
     private func startTimer(untilUptime deadline: UInt64, _ fire: @escaping @Sendable () async -> Void) -> Task<Void, Never> {
-        return Task {
+        return Task(priority: .userInitiated) {
             guard await sleep(untilUptime: deadline) else {
                 return
             }
@@ -739,7 +844,7 @@
     /// makes them is released.
     @available(macOS 10.15, *)
     private func pumpReports(_ reports: AsyncStream<StreamBridge.Stamped>, into owner: WeakChannel) {
-        Task {
+        Task(priority: .userInitiated) {
             for await report in reports {
                 guard let channel = owner.object else {
                     return
@@ -770,7 +875,8 @@
 
     /// Receives what the stream reports, on whatever thread it reports, and hands it to the actor through
     /// an `AsyncStream`: the one bridge between the stream's world and the actor's. Each report carries
-    /// the session the actor was in when it was made.
+    /// the session the actor was in when it was made, and its number among all the reports posted: the
+    /// actor can tell, by numbers alone, what the stream reported before something the actor did.
     @available(macOS 10.15, *)
     private final class StreamBridge: SerialByteStreamDelegate, @unchecked Sendable {
         enum Report: @unchecked Sendable {
@@ -782,6 +888,8 @@
 
         struct Stamped: @unchecked Sendable {
             let generation: Int
+            /// From 1, in the order the reports were posted.
+            let sequence: Int
             let report: Report
         }
 
@@ -789,6 +897,14 @@
         private let continuation: AsyncStream<Stamped>.Continuation
         private let lock = NSLock()
         private var generation = 0
+        private var sequence = 0
+
+        /// How many reports have been posted so far: those numbered up to it were posted before this call.
+        var posted: Int {
+            lock.lock()
+            defer { lock.unlock() }
+            return sequence
+        }
 
         init() {
             let (reports, continuation) = makeMailbox(Stamped.self)
@@ -820,11 +936,12 @@
             post(.closed(reason))
         }
 
-        /// Stamps and yields under one lock, so reports of one session reach the actor in the order they
-        /// were made.
+        /// Numbers, stamps and yields under one lock, so reports reach the actor in the order of their
+        /// numbers, and `posted` is exact.
         private func post(_ report: Report) {
             lock.lock()
-            continuation.yield(Stamped(generation: generation, report: report))
+            sequence += 1
+            continuation.yield(Stamped(generation: generation, sequence: sequence, report: report))
             lock.unlock()
         }
     }

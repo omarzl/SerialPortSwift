@@ -17,6 +17,18 @@ jobs:
       - name: Build and test with the oldest supported compiler
         run: docker run --rm -v "$PWD:/src" -w /src swift:5.1 swift test --enable-test-discovery
 
+  linux-swift-5_7:
+    name: Linux, Swift 5.7
+    runs-on: ubuntu-latest
+    container: swift:5.7
+    steps:
+      - uses: actions/checkout@v5
+      - name: Build the concurrency product without warnings, with the oldest compiler it supports
+        # The minimum of SerialPortSwiftConcurrency (see "The concurrency product" in CONTRIBUTING.md).
+        run: swift build -Xswiftc -warnings-as-errors --target SerialPortSwiftConcurrency
+      - name: Test the concurrency product
+        run: swift test --filter SerialPortSwiftConcurrencyTests
+
   linux-swift-6:
     name: Linux, Swift 6.0
     runs-on: ubuntu-latest

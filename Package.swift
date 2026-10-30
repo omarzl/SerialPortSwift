@@ -16,7 +16,7 @@ let package = Package(
         /// Stand-ins for a real device: a simulated device, a scripted replay and a pseudo-terminal.
         /// For tests and simulators; an app does not need it in its shipping build.
         .library(name: "SerialPortSwiftSimulation", targets: ["SerialPortSwiftSimulation"]),
-        /// The request/response channel as an actor with async/await. Needs Swift 5.5 and macOS 10.15;
+        /// The request/response channel as an actor with async/await. Needs Swift 5.7 and macOS 10.15;
         /// with an older compiler it builds empty, so the rest of the package keeps its Swift 5.1 floor.
         .library(name: "SerialPortSwiftConcurrency", targets: ["SerialPortSwiftConcurrency"])
     ],

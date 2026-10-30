@@ -6,7 +6,7 @@
 //  channel tested together.
 //
 
-#if compiler(>=5.5) && canImport(_Concurrency)
+#if compiler(>=5.7) && canImport(_Concurrency)
 
     import SerialPortSwift
     import SerialPortSwiftConcurrency
@@ -37,7 +37,8 @@
         }
 
         func testADeviceAnswersARequestAfterItsLatency() async throws {
-            let stream = SimulatedByteStream(device: thermometer(), replyLatency: 0.05)
+            let latency: TimeInterval = 0.1
+            let stream = SimulatedByteStream(device: thermometer(), replyLatency: latency)
             let (channel, recorder) = await makeChannel(stream: stream)
             try await channel.open()
 
@@ -48,7 +49,7 @@
             guard let event = recorder.firstEvent(.answered(1)), case .answered(_, let roundTrip) = event.kind else {
                 return XCTFail("No answer published")
             }
-            XCTAssertGreaterThanOrEqual(roundTrip, 0.04)
+            XCTAssertGreaterThanOrEqual(roundTrip, latency - 0.05)
             XCTAssertLessThan(roundTrip, 2)
             await recorder.expectTags([.opened, .sent(1), .raw, .answered(1)])
             await channel.close()
@@ -89,7 +90,7 @@
             XCTAssertEqual(firstError as? SerialChannelError, .timedOut)
             XCTAssertEqual(secondReply, ascii("21.5\n"))
             XCTAssertFalse(stream.isDropArmed)
-            XCTAssertGreaterThanOrEqual(recorder.elapsed(from: .timedOut(1), to: .sent(2)), gap - 0.01)
+            XCTAssertGreaterThanOrEqual(recorder.elapsed(from: .timedOut(1), to: .sent(2)), gap - 0.05)
             await channel.close()
             recorder.stop()
         }

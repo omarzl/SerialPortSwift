@@ -6,7 +6,7 @@
 //  fails, an open that fails, a stream that opens late, a channel used when it is not open.
 //
 
-#if compiler(>=5.5) && canImport(_Concurrency)
+#if compiler(>=5.7) && canImport(_Concurrency)
 
     import SerialPortSwift
     import SerialPortSwiftConcurrency
@@ -245,6 +245,45 @@
             }
         }
 
+        func testAStreamsLateReportOfTheCloseTheChannelAskedForDoesNotEndTheNextOpen() async throws {
+            let rig = await ManualRig()
+            try await rig.open()
+            await rig.channel.close()
+            let reopening = await rig.beginOpening()
+
+            // The stream reports the close the channel asked for after the next open has begun.
+            rig.stream.completeClose(.requested)
+            rig.stream.completeOpen()
+            try await reopening.value
+
+            let isOpen = await rig.channel.isOpen
+            XCTAssertTrue(isOpen)
+            await rig.recorder.expectTags([.opened, .closed(.requested), .opened])
+            await rig.shutDown()
+        }
+
+        func testClosingAndOpeningAgainInsideThePauseAfterATimeoutLeavesTheNewSessionFree() async throws {
+            let script: [ReplayStep] = [.silence()]
+            try await withRig(script: script, gap: 5) { rig in
+                let first = Task { try await rig.channel.request(exchange(1, "1", timeout: 0.05)) }
+                _ = await errorOf { try await first.value }
+                await waitUntil { rig.recorder.has(.timedOut(1)) }
+
+                await rig.channel.close()
+                rig.stream.append([.reply(with: [ReplayChunk(ascii("N"), at: 0.01)])])
+                try await rig.channel.open()
+                let started = Date()
+                let reply = try await rig.channel.request(exchange(2, "2", timeout: 1))
+
+                // The pause of the old session (5 s) does not hold back the new one.
+                XCTAssertEqual(reply, ascii("N"))
+                XCTAssertLessThan(Date().timeIntervalSince(started), 2)
+                await rig.recorder.expectTagsWithoutRaw(
+                    [.opened, .sent(1), .timedOut(1), .closed(.requested), .opened, .sent(2), .answered(2)]
+                )
+            }
+        }
+
         // MARK: A stream that opens late
 
         func testOpenWaitsForAStreamThatOpensLaterAndAnotherOpenWaitsWithIt() async throws {
@@ -374,13 +413,8 @@
         func testWhatTheStreamReportsFromInsideACloseDoesNotTouchTheNextSession() async throws {
             // The stream reports the close from inside the call, and that report may still be on its way to
             // the channel when the next session begins: it is the old session's, and the open goes on.
-            // The rigs are kept until the end: the runtime of Swift 5.5 can hang when channels that have an
-            // events consumer are released and made again in quick succession.
-            var rigs: [ManualRig] = []
-            defer { rigs.removeAll() }
             for iteration in 0..<25 {
                 let rig = await ManualRig()
-                rigs.append(rig)
                 rig.stream.closeReport = .requested
                 try await rig.open()
                 let pending = Task { try await rig.channel.request(exchange(1, "1")) }
@@ -405,6 +439,30 @@
                 await rig.recorder.expectTags([.opened, .sent(1), .closed(.requested), .opened])
                 await rig.shutDown()
             }
+        }
+
+        func testChannelsWithAnEventsConsumerCanBeReleasedAndMadeAgainInQuickSuccession() async throws {
+            // A lost wake-up in the concurrency runtime of Swift 5.5 hung this; it is the reason for the
+            // minimum of Swift 5.7 (see CONTRIBUTING.md).
+            let finished = await completes(within: 20) {
+                for _ in 0..<100 {
+                    let stream = ManualByteStream()
+                    let channel = SerialChannel(stream: stream)
+                    let events = await channel.events()
+                    _ = Task {
+                        for await _ in events {}
+                    }
+                    let opening = Task { try await channel.open() }
+                    while stream.openCalls == 0 {
+                        await Task.yield()
+                    }
+                    stream.completeOpen()
+                    try? await opening.value
+                    await channel.close()
+                }
+            }
+
+            XCTAssertTrue(finished, "channels with a consumer of their events could not be released and made again")
         }
 
         func testOpeningAndClosingFromTwoTasksNeverLeavesTheChannelStuck() async throws {

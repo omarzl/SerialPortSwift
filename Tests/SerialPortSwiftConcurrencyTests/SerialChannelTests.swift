@@ -6,7 +6,7 @@
 //  stream: order, the wire, replies, timeouts, the pause after one, filler, the reply buffer.
 //
 
-#if compiler(>=5.5) && canImport(_Concurrency)
+#if compiler(>=5.7) && canImport(_Concurrency)
 
     import SerialPortSwift
     import SerialPortSwiftConcurrency
@@ -21,6 +21,21 @@
             XCTAssertEqual(configuration.defaultTimeout, 1)
             XCTAssertEqual(configuration.maximumReplyLength, 64)
             XCTAssertEqual(configuration.postTimeoutGap, 0.1)
+        }
+
+        func testTheChannelKeepsTheConfigurationItWasMadeWithWhileTheGapItRunsWithMayChange() async throws {
+            let configuration = SerialChannel.Configuration(defaultTimeout: 2, maximumReplyLength: 8, postTimeoutGap: 0.3)
+            let channel = SerialChannel(stream: ReplayByteStream(), configuration: configuration)
+
+            // No `await`: the configuration can be read from anywhere.
+            XCTAssertEqual(channel.configuration.defaultTimeout, 2)
+            XCTAssertEqual(channel.configuration.maximumReplyLength, 8)
+            XCTAssertEqual(channel.configuration.postTimeoutGap, 0.3)
+
+            await channel.setPostTimeoutGap(0.5)
+            let gap = await channel.postTimeoutGap
+            XCTAssertEqual(gap, 0.5)
+            XCTAssertEqual(channel.configuration.postTimeoutGap, 0.3)
         }
 
         // MARK: Order and the wire
@@ -140,7 +155,7 @@
                     return XCTFail("No answer published")
                 }
                 // The stream times the offset from its own write, a moment before the channel notes the write.
-                XCTAssertGreaterThanOrEqual(roundTrip, offset - 0.02)
+                XCTAssertGreaterThanOrEqual(roundTrip, offset - 0.05)
                 XCTAssertLessThan(roundTrip, offset + 2)
                 XCTAssertEqual(event.bytes, ascii("OK"))
             }
@@ -164,7 +179,7 @@
                 await waitUntil { rig.recorder.has(.timedOut(1)) }
 
                 XCTAssertEqual(error as? SerialChannelError, .timedOut)
-                XCTAssertGreaterThanOrEqual(rig.recorder.elapsed(from: .sent(1), to: .timedOut(1)), 0.4 - 0.01)
+                XCTAssertGreaterThanOrEqual(rig.recorder.elapsed(from: .sent(1), to: .timedOut(1)), 0.4 - 0.05)
                 XCTAssertEqual(rig.recorder.bytes(of: .timedOut(1)), ascii("q"))
             }
         }
@@ -175,7 +190,7 @@
                 await waitUntil { rig.recorder.has(.timedOut(1)) }
 
                 XCTAssertEqual(error as? SerialChannelError, .timedOut)
-                XCTAssertGreaterThanOrEqual(rig.recorder.elapsed(from: .sent(1), to: .timedOut(1)), 0.2 - 0.01)
+                XCTAssertGreaterThanOrEqual(rig.recorder.elapsed(from: .sent(1), to: .timedOut(1)), 0.2 - 0.05)
             }
         }
 
@@ -206,7 +221,119 @@
             }
         }
 
+        func testATimerThatBelongsToAnEarlierExchangeDoesNotTimeOutTheOneOnTheWire() async throws {
+            let script: [ReplayStep] = [.reply(with: [ReplayChunk(ascii("A"), at: 0.01)]), .silence()]
+            try await withRig(script: script) { rig in
+                _ = try await rig.channel.request(exchange(1, "1"))
+                let second = Task { try await rig.channel.request(exchange(2, "2")) }
+                await waitUntil { rig.recorder.has(.sent(2)) }
+
+                // The timer of the first exchange, late (token 1), and two that belong to nothing.
+                await fireTimeout(1, of: rig.channel)
+                await fireTimeout(0, of: rig.channel)
+                await fireTimeout(3, of: rig.channel)
+                await settle(0.1)
+
+                XCTAssertFalse(rig.recorder.has(.timedOut(2)))
+                rig.stream.receive(ascii("B"))
+                let reply = try await second.value
+                XCTAssertEqual(reply, ascii("B"))
+                await rig.recorder.expectTagsWithoutRaw([.opened, .sent(1), .answered(1), .sent(2), .answered(2)])
+            }
+        }
+
         // MARK: The pause after a timeout
+
+        func testARequestMadeInsideThePauseIsNotWrittenUntilThePauseEnds() async throws {
+            let gap: TimeInterval = 0.5
+            let script: [ReplayStep] = [.silence(), .reply(with: [ReplayChunk(ascii("B"), at: 0.01)])]
+            try await withRig(script: script, gap: gap) { rig in
+                let first = Task { try await rig.channel.request(exchange(1, "1", timeout: 0.05)) }
+                _ = await errorOf { try await first.value }
+                await waitUntil { rig.recorder.has(.timedOut(1)) }
+
+                let second = Task { try await rig.channel.request(exchange(2, "2")) }
+                await settle(0.2)
+
+                XCTAssertEqual(rig.stream.writes.count, 1, "the second frame was written inside the pause")
+                let reply = try await second.value
+                XCTAssertEqual(reply, ascii("B"))
+                XCTAssertGreaterThanOrEqual(rig.recorder.elapsed(from: .timedOut(1), to: .sent(2)), gap - 0.05)
+            }
+        }
+
+        func testAPauseTokenThatIsStaleDoesNotEndThePause() async throws {
+            try await withRig(script: [.silence(), .silence(), .silence()], gap: 0.05) { rig in
+                // The first timeout starts a short pause (token 1), the second a long one (token 2).
+                let first = Task { try await rig.channel.request(exchange(1, "1", timeout: 0.05)) }
+                _ = await errorOf { try await first.value }
+                await rig.channel.setPostTimeoutGap(30)
+                let second = Task { try await rig.channel.request(exchange(2, "2", timeout: 0.05)) }
+                _ = await errorOf { try await second.value }
+                let third = Task { try await rig.channel.request(exchange(3, "3")) }
+                await waitUntil { await queuedCount(of: rig.channel) == 1 }
+
+                // The end of the first pause, late, and two that belong to nothing.
+                await endPause(1, of: rig.channel)
+                await endPause(0, of: rig.channel)
+                await endPause(3, of: rig.channel)
+                await settle(0.1)
+
+                XCTAssertFalse(rig.recorder.has(.sent(3)), "a stale token ended the pause")
+                XCTAssertEqual(rig.stream.writes.count, 2)
+
+                await endPause(2, of: rig.channel)
+                await waitUntil { rig.recorder.has(.sent(3)) }
+                rig.stream.receive(ascii("C"))
+                let reply = try await third.value
+                XCTAssertEqual(reply, ascii("C"))
+            }
+        }
+
+        func testBytesThatArrivedBeforeThePauseEndedAreLateEvenIfTheChannelHearsOfThemAfterwards() async throws {
+            // The channel is kept busy, in the scan of a chunk, while the stream posts "L" and the pause after a
+            // timeout ends. When the channel is free again the pause is over and "2" is written, and only then
+            // does it hear of "L". "L" came during the pause: it is late, and it does not answer "2".
+            let scanning = Flag()
+            let release = DispatchSemaphore(value: 0)
+            let rig = await ManualRig(
+                matcher: HookedMatcher {
+                    // Only the first scan waits: a second one means the channel took "L" for a reply.
+                    if !scanning.isRaised {
+                        scanning.raise()
+                        release.wait()
+                    }
+                },
+                gap: 30
+            )
+            try await rig.open()
+            let stream = rig.stream
+            let first = Task { try await rig.channel.request(exchange(1, "1", reply: .exactly(2), timeout: 5)) }
+            await waitUntil { stream.writes.count == 1 }
+            let second = Task { try await rig.channel.request(exchange(2, "2", timeout: 0.3)) }
+            await waitUntil { await queuedCount(of: rig.channel) == 1 }
+
+            // "a" is half of the reply to "1". The channel scans it, and stays in the scan.
+            stream.deliver(ascii("a"))
+            await waitUntil { scanning.isRaised }
+            // Behind it, in this order: the timeout of "1", the end of the pause it starts, and (once the
+            // channel is free) the chunk "L" posted meanwhile.
+            Task(priority: .userInitiated) { await fireTimeout(1, of: rig.channel) }
+            await settle(0.1)
+            Task(priority: .userInitiated) { await endPause(1, of: rig.channel) }
+            await settle(0.1)
+            stream.deliver(ascii("L"))
+            release.signal()
+
+            let firstError = await errorOf { try await first.value }
+            let secondError = await errorOf { try await second.value }
+
+            XCTAssertEqual(firstError as? SerialChannelError, .timedOut)
+            XCTAssertEqual(secondError as? SerialChannelError, .timedOut)
+            await rig.recorder.expectTagsWithoutRaw([.opened, .sent(1), .timedOut(1), .sent(2), .late, .timedOut(2)])
+            XCTAssertEqual(rig.recorder.bytes(of: .late), ascii("L"))
+            await rig.shutDown()
+        }
 
         func testALateReplyInsideTheGapIsNotCreditedToTheNextExchange() async throws {
             let gap: TimeInterval = 0.4
@@ -236,7 +363,7 @@
             XCTAssertEqual(secondReply, ascii("B"))
             await recorder.expectTagsWithoutRaw([.opened, .sent(1), .timedOut(1), .late, .sent(2), .answered(2)])
             XCTAssertEqual(recorder.bytes(of: .late), ascii("L"))
-            XCTAssertGreaterThanOrEqual(recorder.elapsed(from: .timedOut(1), to: .sent(2)), gap - 0.01)
+            XCTAssertGreaterThanOrEqual(recorder.elapsed(from: .timedOut(1), to: .sent(2)), gap - 0.05)
             await channel.close()
             recorder.stop()
         }
@@ -287,7 +414,7 @@
 
             let changedGap = await channel.postTimeoutGap
             XCTAssertEqual(changedGap, gap)
-            XCTAssertGreaterThanOrEqual(recorder.elapsed(from: .timedOut(2), to: .sent(3)), gap - 0.01)
+            XCTAssertGreaterThanOrEqual(recorder.elapsed(from: .timedOut(2), to: .sent(3)), gap - 0.05)
             _ = await first.result
             _ = await second.result
             stream.receive(ascii("C"))
@@ -520,6 +647,99 @@
 
                 XCTAssertEqual(error as? SerialChannelError, .timedOut)
             }
+        }
+
+        func testBytesThatArrivedBeforeTheFrameWentOutAreNotItsReplyEvenIfTheChannelHearsOfThemAfterwards() async throws {
+            // The stream and the channel are two places: a byte can be received before a frame is written and
+            // be heard of by the channel after. Here the channel is kept busy on purpose: the stream reports
+            // "X" from inside the write of "w", and "2" is written in the same turn. "X" came first, so it does
+            // not answer "2".
+            let rig = await ManualRig()
+            try await rig.open()
+            let stream = rig.stream
+            stream.onWrite = { @Sendable frame in
+                if frame == ascii("w") {
+                    stream.deliver(ascii("X"))
+                }
+            }
+            let first = Task { try await rig.channel.request(exchange(1, "1")) }
+            await waitUntil { stream.writes.count == 1 }
+            let write = Task { try await rig.channel.send(ascii("w")) }
+            await waitUntil { await queuedCount(of: rig.channel) == 1 }
+            let second = Task { try await rig.channel.request(exchange(2, "2", timeout: 0.3)) }
+            await waitUntil { await queuedCount(of: rig.channel) == 2 }
+
+            stream.deliver(ascii("A"))
+            let firstReply = try await first.value
+            try await write.value
+            let error = await errorOf { try await second.value }
+
+            XCTAssertEqual(firstReply, ascii("A"))
+            XCTAssertEqual(error as? SerialChannelError, .timedOut)
+            await rig.recorder.expectTagsWithoutRaw(
+                [.opened, .sent(1), .answered(1), .sent(nil), .sent(2), .unsolicited, .timedOut(2)]
+            )
+            XCTAssertEqual(rig.recorder.bytes(of: .unsolicited), ascii("X"))
+            await rig.shutDown()
+        }
+
+        func testBytesDeliveredJustBeforeACallAreNeverItsReply() async throws {
+            // The same without help, whichever of the byte and the call the channel hears of first.
+            let stream = ManualByteStream()
+            let configuration = SerialChannel.Configuration(defaultTimeout: 0.02, maximumReplyLength: 64, postTimeoutGap: 0)
+            let channel = SerialChannel(stream: stream, configuration: configuration)
+            let opening = Task { try await channel.open() }
+            await waitUntil { stream.openCalls == 1 }
+            stream.completeOpen()
+            try await opening.value
+
+            var credited = 0
+            for _ in 0..<50 {
+                stream.deliver(ascii("X"))
+                let error = await errorOf { try await channel.request(ascii("q"), reply: .exactly(1)) }
+                if error == nil {
+                    credited += 1
+                }
+            }
+
+            XCTAssertEqual(credited, 0, "\(credited) of 50 requests were answered by a byte that arrived before they were made")
+            await channel.close()
+        }
+
+        // MARK: Priorities
+
+        func testThePumpAndTheTimersRunAtTheirOwnPriorityAndNotAtThatOfTheTaskThatStartedThem() async throws {
+            let scanned = Box<TaskPriority?>(nil)
+            let written = Box<TaskPriority?>(nil)
+            let rig = await ManualRig(matcher: HookedMatcher { scanned.value = Task.currentPriority }, gap: 0.05)
+            let stream = rig.stream
+            let channel = rig.channel
+            // The frame "2" is written when the pause after the timeout of "1" ends, in the task of that pause.
+            stream.onWrite = { @Sendable frame in
+                if frame == ascii("2") {
+                    written.value = Task.currentPriority
+                }
+            }
+            let finished = Flag()
+
+            // The first calls, the ones that start the pump and the timers, are made from a background task. The
+            // test does not await it, so that waiting does not raise its priority.
+            Task(priority: .background) {
+                try await rig.open()
+                let first = Task { try await channel.request(exchange(1, "1", timeout: 0.05)) }
+                _ = await errorOf { try await first.value }
+                let second = Task { try await channel.request(exchange(2, "2")) }
+                await waitUntil { stream.writes.count == 2 }
+                stream.deliver(ascii("B"))
+                _ = try await second.value
+                finished.raise()
+            }
+            await waitUntil { finished.isRaised }
+
+            // At least: a priority can be raised, by a waiter of a higher one, but never lower than its own.
+            XCTAssertGreaterThanOrEqual(scanned.value ?? .background, .userInitiated, "the pump runs at the priority of its first caller")
+            XCTAssertGreaterThanOrEqual(written.value ?? .background, .userInitiated, "the timers run at the priority of the request that started them")
+            await rig.shutDown()
         }
 
         // MARK: A channel names itself

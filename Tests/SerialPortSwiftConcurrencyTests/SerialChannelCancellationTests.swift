@@ -5,7 +5,7 @@
 //  Cancelling the task of a request, waiting for the channel to be idle, and watching its events.
 //
 
-#if compiler(>=5.5) && canImport(_Concurrency)
+#if compiler(>=5.7) && canImport(_Concurrency)
 
     import SerialPortSwift
     import SerialPortSwiftConcurrency
@@ -46,6 +46,31 @@
                     [.opened, .sent(1), .cancelled([2]), .answered(1), .sent(3), .answered(3)]
                 )
             }
+        }
+
+        func testARequestCancelledWhileTheOneAheadOfItIsBeingAnsweredIsNeverWritten() async throws {
+            // The channel scans the reply to "1" on its actor, and the cancellation happens inside the scan:
+            // `cancel()` has returned, and the channel has not yet been asked to take "2" out of the queue (that
+            // needs the actor, which is busy), when it looks at what is next in line.
+            let doomed = Box<Task<Data, Error>?>(nil)
+            let rig = await ManualRig(matcher: HookedMatcher { doomed.value?.cancel() })
+            try await rig.open()
+            let first = Task { try await rig.channel.request(exchange(1, "1")) }
+            await waitUntil { rig.stream.writes.count == 1 }
+            let second = Task { try await rig.channel.request(exchange(2, "2", timeout: 0.3)) }
+            await waitUntil { await queuedCount(of: rig.channel) == 1 }
+            doomed.value = second
+
+            rig.stream.deliver(ascii("A"))
+            let firstReply = try await first.value
+            let error = await errorOf { try await second.value }
+            await settle(0.1)
+
+            XCTAssertEqual(firstReply, ascii("A"))
+            XCTAssertTrue(error is CancellationError, "\(String(describing: error))")
+            XCTAssertEqual(rig.stream.writes, [ascii("1")])
+            await rig.recorder.expectTagsWithoutRaw([.opened, .sent(1), .answered(1), .cancelled([2])])
+            await rig.shutDown()
         }
 
         func testACancelledRequestOnTheWireIsLeftToItsReplyAndHoldsTheWireUntilThen() async throws {
@@ -169,6 +194,8 @@
                 _ = try await first.value
                 try await write.value
                 await waitUntil { idle.isRaised }
+                // The stream notes a write a moment after the channel makes it.
+                await waitUntil { rig.stream.writes.count == 2 }
 
                 // The write behind the exchange went out before the channel was idle.
                 XCTAssertEqual(rig.writtenFrames, [ascii("1"), ascii("w")])
@@ -252,8 +279,9 @@
             }
         }
 
-        func testCancellingTheRequestsQueuedBehindAPauseMakesTheChannelIdle() async throws {
-            try await withRig(script: [.silence(), .silence()], gap: 3) { rig in
+        func testCancellingTheRequestsQueuedBehindAPauseMakesTheChannelIdleAtOnce() async throws {
+            // The pause is far longer than the wait, so only the cancellation can wake the waiter in time.
+            try await withRig(script: [.silence(), .silence()], gap: 30) { rig in
                 let first = Task { try await rig.channel.request(exchange(1, "1", timeout: 0.05)) }
                 await waitUntil { rig.stream.writes.count == 1 }
                 let second = Task { try await rig.channel.request(exchange(2, "2")) }
@@ -265,6 +293,7 @@
                     await channel.waitUntilIdle()
                     idle.raise()
                 }
+                await waitUntil { await idleWaiterCount(of: channel) == 1 }
                 await settle(0.1)
                 XCTAssertFalse(idle.isRaised)
 
@@ -272,7 +301,8 @@
                 let error = await errorOf { try await second.value }
 
                 XCTAssertTrue(error is CancellationError)
-                await waitUntil { idle.isRaised }
+                let woke = await waitUntil(timeout: 1, report: false) { idle.isRaised }
+                XCTAssertTrue(woke, "the cancellation did not wake the one who waits for the channel to be idle")
                 XCTAssertFalse(rig.recorder.has(.sent(2)))
             }
         }
@@ -283,12 +313,37 @@
                 await waitUntil { rig.recorder.has(.sent(1)) }
                 let channel = rig.channel
                 let waiter = Task { await channel.waitUntilIdle() }
+                await waitUntil { await idleWaiterCount(of: channel) == 1 }
                 await settle(0.1)
+
+                // Busy, and cancelled: it does not wait.
+                waiter.cancel()
+                let returned = await completes { await waiter.value }
+
+                XCTAssertTrue(returned)
+                await waitUntil { await idleWaiterCount(of: channel) == 0 }
+                rig.stream.receive(ascii("A"))
+                _ = try await pending.value
+            }
+        }
+
+        func testWaitUntilIdleInATaskThatWasCancelledBeforeItWaitsReturnsAtOnceAndLeavesNothingBehind() async throws {
+            try await withRig(script: [.silence()]) { rig in
+                let pending = Task { try await rig.channel.request(exchange(1, "1")) }
+                await waitUntil { rig.recorder.has(.sent(1)) }
+                let channel = rig.channel
+                let waiter = Task { () -> Void in
+                    while !Task.isCancelled {
+                        await Task.yield()
+                    }
+                    await channel.waitUntilIdle()
+                }
 
                 waiter.cancel()
                 let returned = await completes { await waiter.value }
 
                 XCTAssertTrue(returned)
+                await waitUntil { await idleWaiterCount(of: channel) == 0 }
                 rig.stream.receive(ascii("A"))
                 _ = try await pending.value
             }
