@@ -133,10 +133,12 @@ public struct TailScanMatcher: ReplyMatcher {
     }
 }
 
-// `Sendable` is a marker with nothing at run time; a compiler older than 5.5 does not know it.
+// `Sendable` is a marker with nothing at run time; a compiler older than 5.5 does not know it. The types
+// that carry `Data` or `Date` say `@unchecked`: Foundation on Linux does not mark those `Sendable` in older
+// toolchains, which then refuse (5.5, 5.6) or warn about (5.7 and later ones) a plain conformance.
 #if compiler(>=5.5)
     extension ReplyVerdict: Sendable {}
-    extension ReplyScan: Sendable {}
+    extension ReplyScan: @unchecked Sendable {}
     extension TailScanMatcher: Sendable {}
     extension TailScanMatcher.LengthUnit: Sendable {}
 #endif
