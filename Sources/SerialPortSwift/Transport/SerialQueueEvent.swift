@@ -53,3 +53,9 @@ public struct SerialQueueEvent: Equatable {
 public protocol SerialQueueObserver: AnyObject {
     func requestQueue(_ queue: SerialRequestQueue, didLog event: SerialQueueEvent)
 }
+
+// `Sendable` is a marker with nothing at run time; a compiler older than 5.5 does not know it.
+#if compiler(>=5.5)
+    extension SerialQueueEvent: Sendable {}
+    extension SerialQueueEvent.Kind: Sendable {}
+#endif

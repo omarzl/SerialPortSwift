@@ -132,3 +132,11 @@ public struct TailScanMatcher: ReplyMatcher {
         }
     }
 }
+
+// `Sendable` is a marker with nothing at run time; a compiler older than 5.5 does not know it.
+#if compiler(>=5.5)
+    extension ReplyVerdict: Sendable {}
+    extension ReplyScan: Sendable {}
+    extension TailScanMatcher: Sendable {}
+    extension TailScanMatcher.LengthUnit: Sendable {}
+#endif
