@@ -60,3 +60,13 @@ fastlane/report.xml
 fastlane/Preview.html
 fastlane/screenshots/**/*.png
 fastlane/test_output
+
+# Local build folders (one per toolchain)
+.build-*/
+.swiftpm/
+
+# Prebuilt frameworks: project.yml is the source of truth and the Xcode project is generated from it
+# (Scripts/build-xcframeworks.sh), so the project is never committed. The same script writes its
+# archives and XCFrameworks under build/.
+*.xcodeproj
+/build/

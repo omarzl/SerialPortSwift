@@ -1,0 +1,80 @@
+name: Release
+
+# Pushing a tag such as 1.2.3 (a semantic version, no prefix) builds the XCFrameworks and publishes them as a
+# GitHub Release. Other tags are ignored. See "Releases" in CONTRIBUTING.md.
+on:
+  push:
+    tags:
+      - '[0-9]+.[0-9]+.[0-9]+'
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Publish XCFrameworks
+    runs-on: macos-latest
+    env:
+      TAG: ${{ github.ref_name }}
+    steps:
+      - uses: actions/checkout@v5
+      - name: Check the tag
+        run: |
+          if ! [[ "$TAG" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::The tag '$TAG' is not a semantic version like 1.2.3."
+            exit 1
+          fi
+      - name: Select Xcode
+        # The newest installed release Xcode that is not newer than the limit in Scripts/select-xcode.sh.
+        run: |
+          developer_dir="$(Scripts/select-xcode.sh)"
+          echo "DEVELOPER_DIR=$developer_dir" >> "$GITHUB_ENV"
+      - name: Install XcodeGen
+        run: brew install xcodegen
+      - name: Build, verify and zip the XCFrameworks
+        env:
+          FRAMEWORK_VERSION: ${{ github.ref_name }}
+        run: Scripts/build-xcframeworks.sh
+      - name: Publish the GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          cd build/xcframeworks
+
+          assets=(
+            SerialPortSwift.xcframework.zip
+            SerialPortSwift.xcframework.zip.sha256
+            SerialPortSwiftSimulation.xcframework.zip
+            SerialPortSwiftSimulation.xcframework.zip.sha256
+          )
+          for asset in "${assets[@]}"; do
+            if [ ! -f "$asset" ]; then
+              echo "::error::The build did not produce $asset."
+              exit 1
+            fi
+          done
+
+          xcode_version="$(xcodebuild -version | awk 'NR == 1 { print $2 }')"
+          core_checksum="$(cat SerialPortSwift.xcframework.zip.sha256)"
+          simulation_checksum="$(cat SerialPortSwiftSimulation.xcframework.zip.sha256)"
+
+          notes="$RUNNER_TEMP/release-notes.md"
+          {
+            printf 'Prebuilt XCFrameworks for macOS, built with Xcode %s.\n\n' "$xcode_version"
+            printf 'They deploy back to macOS 10.11 (the x86_64 slice; the arm64 slice starts at macOS 11.0) and are built with library evolution, so they ship module interfaces (.swiftinterface).\n\n'
+            printf '| File | SHA-256 (swift package compute-checksum) |\n'
+            printf '| --- | --- |\n'
+            printf '| SerialPortSwift.xcframework.zip | %s |\n' "$core_checksum"
+            printf '| SerialPortSwiftSimulation.xcframework.zip | %s |\n\n' "$simulation_checksum"
+            printf 'SerialPortSwiftSimulation depends on SerialPortSwift. It is for tests and simulators, not for a shipping build.\n'
+          } > "$notes"
+          cat "$notes" >> "$GITHUB_STEP_SUMMARY"
+
+          if gh release view "$TAG" > /dev/null 2>&1; then
+            echo "The release $TAG already exists. Keeping its notes and uploading the files to it."
+          else
+            gh release create "$TAG" --verify-tag --title "$TAG" --notes-file "$notes"
+          fi
+          gh release upload "$TAG" "${assets[@]}" --clobber
