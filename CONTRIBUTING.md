@@ -1,7 +1,8 @@
 # Contributing
 
 SerialPortSwift supports old toolchains and old systems on purpose. Two limits hold for every
-change.
+change to `SerialPortSwift` and `SerialPortSwiftSimulation`. The third product, `SerialPortSwiftConcurrency`,
+has its own minimums: see [The concurrency product](#the-concurrency-product).
 
 ## Swift 5.1 is the language ceiling
 
@@ -31,6 +32,38 @@ No API newer than macOS 10.11 may be used, even behind `#available`. Avoid in pa
 `os_unfair_lock`, `os_log`, `dispatchPrecondition` (macOS 10.12), and the `Network` and
 `Combine` frameworks. Use `NSLock`, or a serial `DispatchQueue`. CI type-checks the macOS sources
 against a macOS 10.11 target.
+
+## The concurrency product
+
+`SerialPortSwiftConcurrency` (`Sources/SerialPortSwiftConcurrency/`) is the request/response channel as an actor with
+`async`/`await`. It is the one place in the package where the Swift 5.1 and macOS 10.11 limits above do not apply.
+
+**Why it is a separate product.** Swift concurrency needs a runtime library, `libswift_Concurrency`, that an app
+deploying to macOS 10.11 cannot load. Code that uses concurrency links it, so `SerialPortSwift` and
+`SerialPortSwiftSimulation` must never use it, and the `async`/`await` engine lives in its own product that an app
+opts into. An app that stays on `SerialPortSwift` never links the concurrency runtime.
+
+**Its minimums.** It needs the Swift 5.5 compiler and macOS 10.15:
+
+- All of its code is inside `#if compiler(>=5.5) && canImport(_Concurrency)`, and its public types are
+  `@available(macOS 10.15, *)`. With an older compiler the target builds empty, so the Swift 5.1 job keeps passing.
+- Its framework is built with a deployment target of macOS 10.15 (`project.yml`). The other two stay at 10.11.
+- The Swift 5.1 list above does not apply to it. Everything else in this file does.
+
+**No continuation wrappers.** The channel is written with native concurrency only: actors, `AsyncStream`, `Task`.
+`withCheckedContinuation`, `withCheckedThrowingContinuation`, `withUnsafeContinuation` and
+`withUnsafeThrowingContinuation` are not used anywhere in the module. A stream reports through its delegate on its
+own queue; those reports enter the actor through an `AsyncStream`.
+
+CI enforces this. The first step of the `Linux, Swift 6.0` job fails if this finds a match on a line that is not only
+a comment (a comment may name the wrappers to forbid them):
+
+```bash
+grep -rnE "with(Checked|Unsafe)(Throwing)?Continuation" Sources/SerialPortSwiftConcurrency
+```
+
+**The core products stay free of it.** `Scripts/build-xcframeworks.sh` runs `otool -L` on both slices of the
+`SerialPortSwift` and `SerialPortSwiftSimulation` binaries and fails if either lists `libswift_Concurrency`.
 
 ## Building and testing
 
@@ -72,21 +105,30 @@ Tags that are not `X.Y.Z` (such as `v1.2.3` or `1.2.3-rc1`) are ignored. SwiftPM
 the package version, so tag the commit you want to release.
 
 The `Release` workflow (`.github/workflows/release.yml`) builds the frameworks and creates the GitHub
-Release for the tag, if it does not exist yet. It uploads `SerialPortSwift.xcframework.zip` and
-`SerialPortSwiftSimulation.xcframework.zip`, each with a `.sha256` file that holds the checksum of the zip as
-`swift package compute-checksum` prints it (the value a SwiftPM `binaryTarget` asks for). The release notes list
-the same checksums. Running the workflow again replaces the files and leaves the notes alone.
+Release for the tag, if it does not exist yet. It uploads `SerialPortSwift.xcframework.zip`,
+`SerialPortSwiftSimulation.xcframework.zip` and `SerialPortSwiftConcurrency.xcframework.zip`, each with a `.sha256`
+file that holds the checksum of the zip as `swift package compute-checksum` prints it (the value a SwiftPM
+`binaryTarget` asks for). The release notes list the same checksums. Running the workflow again replaces the files
+and leaves the notes alone.
 
 ### Why prebuilt frameworks
 
 Xcode applies a deployment-target floor of macOS 10.13 to Swift packages it builds from source, so an app that
 deploys to macOS 10.11 cannot import the package through SwiftPM. An XCFramework built for macOS 10.11 has no such
-floor. `project.yml` describes the two frameworks for XcodeGen. CI generates the Xcode project from it and never
+floor. `project.yml` describes the three frameworks for XcodeGen. CI generates the Xcode project from it and never
 commits it.
 
-Each framework is a universal binary. Its x86_64 slice requires macOS 10.11. Its arm64 slice requires macOS 11.0,
-the oldest system an Apple silicon Mac runs. Both are built with library evolution, so each carries a
-`.swiftinterface`.
+Each framework is a universal binary. The minimum macOS differs per framework:
+
+| Framework | x86_64 slice requires | arm64 slice requires |
+| --- | --- | --- |
+| `SerialPortSwift` | macOS 10.11 | macOS 11.0 |
+| `SerialPortSwiftSimulation` | macOS 10.11 | macOS 11.0 |
+| `SerialPortSwiftConcurrency` | macOS 10.15 | macOS 11.0 |
+
+macOS 11.0 is the oldest system an Apple silicon Mac runs. All three are built with library evolution, so each
+carries a `.swiftinterface`. `SerialPortSwiftSimulation` and `SerialPortSwiftConcurrency` depend on
+`SerialPortSwift`, which they link but do not embed.
 
 ### Why Xcode 26.3 or older
 
@@ -103,9 +145,15 @@ You need macOS, an Xcode that is not newer than the limit, and XcodeGen (`brew i
 DEVELOPER_DIR="$(Scripts/select-xcode.sh)" Scripts/build-xcframeworks.sh
 ```
 
-The script generates the project, archives both frameworks, packs the XCFrameworks and zips them, and writes
+The script generates the project, archives the three frameworks, packs the XCFrameworks and zips them, and writes
 everything to `build/xcframeworks/` (ignored by git). It fails if a binary lacks the arm64 or the x86_64 slice, if
-the x86_64 slice does not require macOS 10.11, or if a `.swiftinterface` is missing or does not name that target.
-It also refuses an Xcode newer than the limit unless you set `ALLOW_NEWER_XCODE=1`. Set `FRAMEWORK_VERSION=1.2.3` to
-stamp a version into the frameworks. The `frameworks` job in `ci.yml` runs the same script on every push and pull
-request and uploads the zips as the `xcframeworks` artifact.
+the x86_64 slice does not require the macOS from the table above (the script holds that minimum per framework), or if
+a `.swiftinterface` is missing or does not name that target. It also fails if the `SerialPortSwift` or
+`SerialPortSwiftSimulation` binary links `libswift_Concurrency`. It refuses an Xcode newer than the limit unless you
+set `ALLOW_NEWER_XCODE=1`. Set `FRAMEWORK_VERSION=1.2.3` to stamp a version into the frameworks. The `frameworks` job
+in `ci.yml` runs the same script on every push and pull request and uploads the three zips and their checksums as the
+`xcframeworks` artifact.
+
+To add a framework, add it to `project.yml` and to `FRAMEWORKS` in the script, and state its minimum macOS in
+`expected_x86_64_min_os`: the script refuses a framework without one. A new framework may not link
+`libswift_Concurrency` unless you change `may_link_concurrency_runtime`.
