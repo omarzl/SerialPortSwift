@@ -161,10 +161,12 @@ The script generates the project, archives the three frameworks, packs the XCFra
 everything to `build/xcframeworks/` (ignored by git). It fails if a binary lacks the arm64 or the x86_64 slice, if
 the x86_64 slice does not require the macOS from the table above (the script holds that minimum per framework), or if
 a `.swiftinterface` is missing or does not name that target. It also fails if the `SerialPortSwift` or
-`SerialPortSwiftSimulation` binary links `libswift_Concurrency`. It refuses an Xcode newer than the limit unless you
-set `ALLOW_NEWER_XCODE=1`. Set `FRAMEWORK_VERSION=1.2.3` to stamp a version into the frameworks. The `frameworks` job
-in `ci.yml` runs the same script on every push and pull request and uploads the three zips and their checksums as the
-`xcframeworks` artifact.
+`SerialPortSwiftSimulation` binary links `libswift_Concurrency`, or if its x86_64 slice references an `OS_*`
+Objective-C class such as `OS_dispatch_queue` directly: macOS 10.11 does not export those classes, so dyld would
+refuse the framework there. The script builds with implicit modules (`SWIFT_ENABLE_EXPLICIT_MODULES=NO`) for that
+reason. It refuses an Xcode newer than the limit unless you set `ALLOW_NEWER_XCODE=1`. Set `FRAMEWORK_VERSION=1.2.3`
+to stamp a version into the frameworks. The `frameworks` job in `ci.yml` runs the same script on every push and pull
+request and uploads the three zips and their checksums as the `xcframeworks` artifact.
 
 To add a framework, add it to `project.yml` and to `FRAMEWORKS` in the script, and state its minimum macOS in
 `expected_x86_64_min_os`: the script refuses a framework without one. A new framework may not link

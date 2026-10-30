@@ -11,7 +11,9 @@
 #      10.15 for SerialPortSwiftConcurrency), and module interfaces (.swiftinterface) that name that target. It also
 #      fails if SerialPortSwift or SerialPortSwiftSimulation link the Swift concurrency runtime
 #      (libswift_Concurrency): apps that deploy to macOS 10.11 cannot load it, and keeping it out of those two is
-#      the reason SerialPortSwiftConcurrency is a separate framework.
+#      the reason SerialPortSwiftConcurrency is a separate framework. And it fails if the x86_64 slice of a
+#      framework that deploys to a macOS older than 10.12 references an OS_* Objective-C class (OS_dispatch_queue,
+#      for example) directly: those systems do not export them, so dyld would refuse to load the framework.
 #   5. Zips each XCFramework and writes the SwiftPM checksum of the zip next to it.
 #
 # Output, in build/xcframeworks/, for each of the three frameworks (SerialPortSwift, SerialPortSwiftSimulation,
@@ -94,6 +96,24 @@ may_link_concurrency_runtime() {
   [ "$1" = "SerialPortSwiftConcurrency" ]
 }
 
+# The first macOS that exports the Objective-C classes of its OS objects (OS_dispatch_queue, OS_dispatch_source,
+# OS_os_log, OS_xpc_object and the rest). Before it they exist only at run time, and a binary must look them up by
+# name.
+OS_OBJECT_CLASSES_MIN_OS=10.12
+
+# Succeeds when macOS version $1 (such as 10.11 or 11.0) is older than version $2.
+macos_version_older_than() {
+  awk -v older="$1" -v newer="$2" 'BEGIN {
+    split(older, a, ".")
+    split(newer, b, ".")
+    for (i = 1; i <= 3; i++) {
+      if (a[i] + 0 < b[i] + 0) exit 0
+      if (a[i] + 0 > b[i] + 0) exit 1
+    }
+    exit 1
+  }'
+}
+
 # Reads the minimum OS version out of the output of `vtool -show-build` or `otool -l` (both print the same
 # field names). That is "minos" under LC_BUILD_VERSION and "version" under LC_VERSION_MIN_MACOSX. The "version"
 # that follows "minos" in LC_BUILD_VERSION is the linker's version, so only the first value is taken.
@@ -159,6 +179,28 @@ check_no_concurrency_runtime() {
   printf '    %s: does not link libswift_Concurrency (%d libraries)\n' "$arch" "$count"
 }
 
+# Fails when the x86_64 slice of the binary $2 (framework $1) references an OS_* Objective-C class directly: a
+# non-weak undefined _OBJC_CLASS_$_OS_* symbol. macOS 10.11 does not export those classes, so dyld refuses to load
+# such a binary there, and the app that links it does not launch.
+check_no_os_object_class_references() {
+  local name="$1" binary="$2"
+  local symbols count classes
+
+  symbols="$(nm -m -arch x86_64 "$binary" 2>&1)" || fail "$name: nm -m could not read the x86_64 slice: $symbols"
+  # A framework always uses something from the system. No undefined symbols means the tool did not do its job, and
+  # the absence of OS_* classes would mean nothing.
+  count="$(printf '%s\n' "$symbols" | grep -c -F -e '(undefined)')" || count=0
+  [ "$count" -gt 0 ] || fail "$name: nm -m listed no undefined symbols for the x86_64 slice, so it cannot show that the slice references no OS_* class. Output: $symbols"
+
+  # One line, so that a GitHub Actions annotation holds all of it.
+  classes="$(printf '%s\n' "$symbols" | grep -F -e '(undefined)' | grep -v -F -e ' weak ' |
+    grep -o -e '_OBJC_CLASS_\$_OS_[A-Za-z0-9_]*' | sort -u | tr '\n' ' ' | sed 's/ $//')" || classes=""
+  if [ -n "$classes" ]; then
+    fail "$name: the x86_64 slice references OS_* Objective-C classes directly, which macOS $OS_OBJECT_CLASSES_MIN_OS is the first to export, so it does not load on older systems. Check that the build uses implicit modules (SWIFT_ENABLE_EXPLICIT_MODULES=NO). Found: $classes"
+  fi
+  printf '    x86_64: references no OS_* class directly (%d undefined symbols)\n' "$count"
+}
+
 verify_xcframework() {
   local name="$1" xcframework="$2"
   local candidate framework="" slices=0 binary archs arch thin min_os expected_min_os target_pattern
@@ -213,6 +255,11 @@ verify_xcframework() {
     rm -f "$thin"
   done
 
+  # A slice that deploys to a system without the OS_* classes must look them up by name rather than link them.
+  if macos_version_older_than "$expected_min_os" "$OS_OBJECT_CLASSES_MIN_OS"; then
+    check_no_os_object_class_references "$name" "$binary"
+  fi
+
   # The module interfaces, for both architectures. The x86_64 one must name the framework's own target.
   check_interfaces "$name" "$framework" x86_64 "$target_pattern"
   check_interfaces "$name" "$framework" arm64 ""
@@ -240,7 +287,7 @@ compute_checksum() {
 step "Checking the toolchain"
 
 # otool is needed even where vtool is: it lists the libraries a binary loads.
-for tool in xcodegen xcodebuild lipo otool ditto swift unzip awk; do
+for tool in xcodegen xcodebuild lipo otool nm ditto swift unzip awk; do
   command -v "$tool" >/dev/null 2>&1 || fail "'$tool' is not on PATH. This script needs macOS with a full Xcode and XcodeGen (brew install xcodegen)."
 done
 
@@ -277,6 +324,10 @@ BUILD_SETTINGS=(
   DEBUG_INFORMATION_FORMAT=dwarf-with-dsym
   CODE_SIGNING_ALLOWED=NO
   CODE_SIGNING_REQUIRED=NO
+  # Implicit modules. With explicit modules, Xcode 26 makes Swift reference the OS_* Objective-C classes
+  # (OS_dispatch_queue, ...) directly even for a macOS 10.11 target, and 10.11 does not export them: dyld refuses the
+  # framework there. Implicit modules keep the lookup by name that the SDK headers ask for below macOS 10.12.
+  SWIFT_ENABLE_EXPLICIT_MODULES=NO
 )
 if [ -n "${FRAMEWORK_VERSION:-}" ]; then
   BUILD_SETTINGS+=("MARKETING_VERSION=$FRAMEWORK_VERSION")
