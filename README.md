@@ -8,6 +8,7 @@ It is a Swift successor to [ORSSerialPort](https://github.com/armadsen/ORSSerial
 - [Quick start](#quick-start)
 - [Finding ports on a Mac](#finding-ports-on-a-mac)
 - [Asking a device and waiting for the answer](#asking-a-device-and-waiting-for-the-answer)
+- [Async/await](#asyncawait)
 - [Port settings](#port-settings)
 - [Watching the traffic](#watching-the-traffic)
 - [Testing without hardware](#testing-without-hardware)
@@ -47,11 +48,12 @@ let package = Package(
 )
 ```
 
-The package has two libraries:
+The package has three libraries:
 
 | Library | What it is for |
 | --- | --- |
 | `SerialPortSwift` | Everything you need in your app: the serial port, port discovery and the request queue. |
+| `SerialPortSwiftConcurrency` | The request queue for `async`/`await`. Needs Swift 5.7 and macOS 10.15 or later. See [Async/await](#asyncawait). |
 | `SerialPortSwiftSimulation` | Fake devices for your tests and simulators. Your shipping app does not need it. See [Testing without hardware](#testing-without-hardware). |
 
 In Xcode, choose **File › Add Packages…**, paste `https://github.com/omarzl/SerialPortSwift.git`, and add the `SerialPortSwift` library to your target.
@@ -326,6 +328,113 @@ let queue = SerialRequestQueue(stream: port, configuration: configuration)
 | `deliveryQueue` | the main queue | Where your delegate is called. |
 
 Your code can also talk to the `SerialTransport` protocol instead of the `SerialRequestQueue` class. The queue conforms to it, so you can swap in another implementation later.
+
+## Async/await
+
+`SerialChannel` does what `SerialRequestQueue` does, for code that uses `async`/`await`: you `await` the answer instead of waiting for a delegate call. It sends one request at a time, in the order you made them, and waits for each answer or timeout before it sends the next.
+
+It lives in its own library, `SerialPortSwiftConcurrency` (see [Installation](#installation)), and it needs Swift 5.7 or later and macOS 10.15 or later. With an older compiler the library is simply empty, and the rest of the package builds as before. An app that deploys to an older macOS keeps using `SerialRequestQueue`.
+
+Add the library to your target:
+
+```swift
+.product(name: "SerialPortSwiftConcurrency", package: "SerialPortSwift")
+```
+
+Open a port through a channel and ask the device a question:
+
+```swift
+import Foundation
+import SerialPortSwift
+import SerialPortSwiftConcurrency
+
+func readTemperature() async {
+    let port = PosixSerialPort(path: "/dev/cu.usbserial-1420", configuration: SerialPortConfiguration(baudRate: 9600))
+    let channel = SerialChannel(stream: port)
+
+    do {
+        try await channel.open()
+
+        // The device answers "T\r" with five bytes, like "21.5\n".
+        let reply = try await channel.request(Data("T\r".utf8), reply: .exactly(5), timeout: 2)
+        print("Temperature: \(String(decoding: reply, as: UTF8.self))")
+    } catch let error as SerialChannelError {
+        switch error {
+        case .notOpen:
+            print("The port is not open")
+        case .timedOut:
+            print("The device did not answer")
+        case .closed(let reason):
+            print("The port closed: \(reason)")
+        }
+    } catch {
+        print("Stopped: \(error)")
+    }
+
+    await channel.close()
+}
+```
+
+- The channel takes over the port, as the queue does. Do not set your own delegate on it, open and close the port only through the channel (`open()` and `close()`, never on the port itself), and keep a reference to the channel while you use it.
+- `open()` returns when the port is open. If the port cannot be opened, it throws `.closed(reason)` with the reason described in [Errors and close reasons](#errors-and-close-reasons). `open()` and `close()` call the port's own `open()` and `close()` from the channel, so a port that blocks in one of them holds the channel for that time.
+- `request(_:reply:timeout:)` returns the answer, raw, exactly as it arrived. `reply` and `timeout` mean what they do for a `SerialExchange` (see [above](#asking-a-device-and-waiting-for-the-answer)); leave `timeout` out for the default of 1 second. If you want to choose the request's number yourself, pass a `SerialExchange` to `request(_:)`. The numbers the channel picks count from 1 on each channel and are not checked against yours, so use one form or the other on a channel, or the events can name two requests by one number.
+- `send(_:)` writes bytes that expect no answer. It returns when the bytes have been handed to the port, and it waits for its turn behind the requests before it.
+- `waitUntilIdle()` returns when nothing is waiting and nothing is on the wire. It returns at once if its task is cancelled.
+- A request throws a `SerialChannelError`:
+
+| Error | What happened |
+| --- | --- |
+| `.notOpen` | The channel was not open when you made the request. Requests are not kept for later. |
+| `.timedOut` | The answer did not arrive in time. |
+| `.closed(reason)` | The channel closed before the answer arrived: you called `close()`, the device went away or the port failed. |
+
+The queue's settings are in `SerialChannel.Configuration`, with the same defaults: `SerialChannel(stream: port, configuration: SerialChannel.Configuration(defaultTimeout: 2, postTimeoutGap: 0.2))`. You can read them back from `channel.configuration`, for example `channel.configuration.defaultTimeout`, without an `await`. The pause after a timeout can also be changed while the channel runs, with `await channel.setPostTimeoutGap(0.2)`; `await channel.postTimeoutGap` is its current value. The channel has no delivery queue: your `await` continues wherever your task runs.
+
+It differs from `SerialRequestQueue` in three more ways:
+
+- A request made while the channel is still opening throws `.notOpen`; the queue keeps it until the port is open. Wait for `open()` to return.
+- Bytes that arrive while the channel is opening produce no events.
+- There is no `cancelQueuedExchanges()`. Cancel the tasks of the requests instead (see below).
+
+### Cancelling a request
+
+A request belongs to the task that made it. Cancel the task and a request that is still waiting its turn is taken out of the queue and throws `CancellationError`. A request that has already been written is left to its answer or its timeout, so that a late answer is never mistaken for the answer to the next request; it returns or throws as usual.
+
+```swift
+let task = Task {
+    try await channel.request(Data("T\r".utf8), reply: .exactly(5))
+}
+
+// Later, when the answer is no longer wanted:
+task.cancel()
+```
+
+### Events
+
+`events()` gives the same events as the observers of a `SerialRequestQueue` (see [Watching the traffic](#watching-the-traffic)), as an `AsyncStream`:
+
+```swift
+let events = await channel.events()
+
+Task {
+    for await event in events {
+        switch event.kind {
+        case .sent:
+            print("-> \(event.bytes ?? Data())")
+        case .raw:
+            print("<- \(event.bytes ?? Data())")
+        default:
+            print("\(event.kind)")
+        }
+    }
+}
+```
+
+Ask for the stream before the task starts, as above, so that the task holds the stream and not the channel: the stream ends when the channel is released, which a task that also held the channel would prevent.
+
+Every call to `events()` gives a stream of its own, so several parts of your app can watch at once. A stream shows what happens from the moment you ask for it, and it ends when you leave the loop, when its task is cancelled, or when the channel is released. A stream keeps every event until it is read, without a limit: if you stop reading a stream but do not end it, it grows with every event the channel publishes. Cancel the task, or leave the loop, when you are done.
+
+The fake devices in [Testing without hardware](#testing-without-hardware) work with a channel too: give a `SimulatedByteStream` or a `ReplayByteStream` to `SerialChannel(stream:)`.
 
 ## Port settings
 

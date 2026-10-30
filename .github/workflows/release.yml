@@ -48,6 +48,8 @@ jobs:
             SerialPortSwift.xcframework.zip.sha256
             SerialPortSwiftSimulation.xcframework.zip
             SerialPortSwiftSimulation.xcframework.zip.sha256
+            SerialPortSwiftConcurrency.xcframework.zip
+            SerialPortSwiftConcurrency.xcframework.zip.sha256
           )
           for asset in "${assets[@]}"; do
             if [ ! -f "$asset" ]; then
@@ -59,16 +61,19 @@ jobs:
           xcode_version="$(xcodebuild -version | awk 'NR == 1 { print $2 }')"
           core_checksum="$(cat SerialPortSwift.xcframework.zip.sha256)"
           simulation_checksum="$(cat SerialPortSwiftSimulation.xcframework.zip.sha256)"
+          concurrency_checksum="$(cat SerialPortSwiftConcurrency.xcframework.zip.sha256)"
 
           notes="$RUNNER_TEMP/release-notes.md"
           {
             printf 'Prebuilt XCFrameworks for macOS, built with Xcode %s.\n\n' "$xcode_version"
-            printf 'They deploy back to macOS 10.11 (the x86_64 slice; the arm64 slice starts at macOS 11.0) and are built with library evolution, so they ship module interfaces (.swiftinterface).\n\n'
+            printf 'SerialPortSwift and SerialPortSwiftSimulation deploy back to macOS 10.11, and SerialPortSwiftConcurrency to macOS 10.15 (the x86_64 slices; the arm64 slices start at macOS 11.0). All three are built with library evolution, so they ship module interfaces (.swiftinterface).\n\n'
             printf '| File | SHA-256 (swift package compute-checksum) |\n'
             printf '| --- | --- |\n'
             printf '| SerialPortSwift.xcframework.zip | %s |\n' "$core_checksum"
-            printf '| SerialPortSwiftSimulation.xcframework.zip | %s |\n\n' "$simulation_checksum"
-            printf 'SerialPortSwiftSimulation depends on SerialPortSwift. It is for tests and simulators, not for a shipping build.\n'
+            printf '| SerialPortSwiftSimulation.xcframework.zip | %s |\n' "$simulation_checksum"
+            printf '| SerialPortSwiftConcurrency.xcframework.zip | %s |\n\n' "$concurrency_checksum"
+            printf 'SerialPortSwiftSimulation depends on SerialPortSwift. It is for tests and simulators, not for a shipping build.\n\n'
+            printf 'SerialPortSwiftConcurrency also depends on SerialPortSwift. It is the async/await channel and needs macOS 10.15 or newer. It is separate so that SerialPortSwift and SerialPortSwiftSimulation never link the Swift concurrency runtime, which apps that deploy to macOS 10.11 cannot load.\n'
           } > "$notes"
           cat "$notes" >> "$GITHUB_STEP_SUMMARY"
 

@@ -33,3 +33,9 @@ public enum SerialStreamError: Error, Equatable {
     /// domain, code and description.
     case system(domain: String, code: Int, description: String)
 }
+
+// `Sendable` is a marker with nothing at run time; a compiler older than 5.5 does not know it.
+#if compiler(>=5.5)
+    extension SerialCloseReason: Sendable {}
+    extension SerialStreamError: Sendable {}
+#endif

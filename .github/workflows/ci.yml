@@ -17,12 +17,49 @@ jobs:
       - name: Build and test with the oldest supported compiler
         run: docker run --rm -v "$PWD:/src" -w /src swift:5.1 swift test --enable-test-discovery
 
+  linux-swift-5_7:
+    name: Linux, Swift 5.7
+    runs-on: ubuntu-latest
+    container: swift:5.7
+    steps:
+      - uses: actions/checkout@v5
+      - name: Build the concurrency product without warnings, with the oldest compiler it supports
+        # The minimum of SerialPortSwiftConcurrency (see "The concurrency product" in CONTRIBUTING.md).
+        run: swift build -Xswiftc -warnings-as-errors --target SerialPortSwiftConcurrency
+      - name: Test the concurrency product
+        run: swift test --filter SerialPortSwiftConcurrencyTests
+
   linux-swift-6:
     name: Linux, Swift 6.0
     runs-on: ubuntu-latest
     container: swift:6.0
     steps:
       - uses: actions/checkout@v5
+      - name: No continuation wrappers in SerialPortSwiftConcurrency
+        # The channel is written with native concurrency only (see "The concurrency product" in CONTRIBUTING.md).
+        # A line that is only a comment may name the wrappers, to forbid them; any other line that does fails.
+        run: |
+          dir=Sources/SerialPortSwiftConcurrency
+          if [ ! -d "$dir" ]; then
+            echo "::error::$dir does not exist, so this check would look at nothing."
+            exit 1
+          fi
+          # grep exits 1 when it finds nothing, which is a pass here, and 2 when it fails, which is not.
+          status=0
+          found="$(grep -rnE 'with(Checked|Unsafe)(Throwing)?Continuation' "$dir")" || status=$?
+          if [ "$status" -gt 1 ]; then
+            echo "::error::grep failed with exit status $status."
+            exit 1
+          fi
+          matches="$(printf '%s\n' "$found" | grep -vE '^[^:]*:[0-9]+:[[:space:]]*//' || true)"
+          if [ -n "$matches" ]; then
+            printf '%s\n' "$matches"
+            printf '%s\n' "$matches" | while IFS=: read -r file line _; do
+              echo "::error file=$file,line=$line::withChecked/withUnsafe(Throwing)Continuation is not allowed in SerialPortSwiftConcurrency. Use native concurrency: an actor, AsyncStream, Task."
+            done
+            exit 1
+          fi
+          echo "No continuation wrappers in $dir."
       - name: Build and test
         run: swift test
 
@@ -65,6 +102,7 @@ jobs:
         run: Scripts/build-xcframeworks.sh
       - name: Upload the XCFrameworks
         # The zips, not the folders: the symbolic links inside a framework do not survive an artifact upload.
+        # The patterns take all three frameworks (SerialPortSwift, SerialPortSwiftSimulation, SerialPortSwiftConcurrency).
         uses: actions/upload-artifact@v5
         with:
           name: xcframeworks

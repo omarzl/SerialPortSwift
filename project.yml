@@ -8,7 +8,12 @@
 #
 #     xcodegen generate
 #
-# Scripts/build-xcframeworks.sh does that, archives both frameworks and packs the XCFrameworks.
+# Scripts/build-xcframeworks.sh does that, archives the three frameworks and packs the XCFrameworks.
+#
+# Deployment targets: SerialPortSwift and SerialPortSwiftSimulation deploy back to macOS 10.11.
+# SerialPortSwiftConcurrency is the exception, with its own minimum of macOS 10.15, the first system that can run
+# Swift concurrency. It is a separate framework so that the other two never link the Swift concurrency runtime.
+# Scripts/build-xcframeworks.sh holds the minimum it expects of each framework and fails if a binary disagrees.
 
 name: SerialPortSwift
 
@@ -17,6 +22,7 @@ options:
 
 settingGroups:
   Distribution:
+    # The floor of SerialPortSwift and SerialPortSwiftSimulation. SerialPortSwiftConcurrency overrides it below.
     MACOSX_DEPLOYMENT_TARGET: "10.11"
     SWIFT_VERSION: "5.0"
     # Library evolution: ship a .swiftinterface so the frameworks stay usable across compiler versions.
@@ -62,5 +68,24 @@ targets:
     settings:
       groups:
         - Distribution
+    scheme:
+      gatherCoverageData: false
+
+  SerialPortSwiftConcurrency:
+    type: framework
+    platform: macOS
+    sources:
+      - path: Sources/SerialPortSwiftConcurrency
+    dependencies:
+      # Linked, not embedded: an app that uses the concurrency module embeds SerialPortSwift itself.
+      - target: SerialPortSwift
+        embed: false
+    settings:
+      groups:
+        - Distribution
+      # Its own minimum: Swift concurrency needs macOS 10.15. Settings merge in the order groups, base, configs, so
+      # this wins over the 10.11 of the Distribution group.
+      base:
+        MACOSX_DEPLOYMENT_TARGET: "10.15"
     scheme:
       gatherCoverageData: false

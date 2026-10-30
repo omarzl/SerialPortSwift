@@ -3,16 +3,22 @@
 # Builds the prebuilt binary frameworks of SerialPortSwift.
 #
 #   1. Generates the Xcode project from project.yml with XcodeGen (the project is never committed).
-#   2. Archives SerialPortSwift and SerialPortSwiftSimulation for macOS (arm64 and x86_64, Release).
+#   2. Archives SerialPortSwift, SerialPortSwiftSimulation and SerialPortSwiftConcurrency for macOS (arm64 and
+#      x86_64, Release).
 #   3. Packs each framework, with its dSYM, into an XCFramework.
 #   4. Verifies the result and fails if it is not what the apps need: both architectures, an x86_64 slice that
-#      deploys back to macOS 10.11, and module interfaces (.swiftinterface) that name that target.
+#      deploys back to the framework's own minimum macOS (10.11 for SerialPortSwift and SerialPortSwiftSimulation,
+#      10.15 for SerialPortSwiftConcurrency), and module interfaces (.swiftinterface) that name that target. It also
+#      fails if SerialPortSwift or SerialPortSwiftSimulation link the Swift concurrency runtime
+#      (libswift_Concurrency): apps that deploy to macOS 10.11 cannot load it, and keeping it out of those two is
+#      the reason SerialPortSwiftConcurrency is a separate framework.
 #   5. Zips each XCFramework and writes the SwiftPM checksum of the zip next to it.
 #
-# Output, in build/xcframeworks/:
-#   SerialPortSwift.xcframework                  SerialPortSwiftSimulation.xcframework
-#   SerialPortSwift.xcframework.zip              SerialPortSwiftSimulation.xcframework.zip
-#   SerialPortSwift.xcframework.zip.sha256       SerialPortSwiftSimulation.xcframework.zip.sha256
+# Output, in build/xcframeworks/, for each of the three frameworks (SerialPortSwift, SerialPortSwiftSimulation,
+# SerialPortSwiftConcurrency):
+#   <name>.xcframework
+#   <name>.xcframework.zip
+#   <name>.xcframework.zip.sha256
 #
 # Needs macOS, a full Xcode and XcodeGen (brew install xcodegen). The build refuses an Xcode newer than the
 # limit in Scripts/select-xcode.sh, because the module interfaces of a newer compiler may not be readable by the
@@ -27,10 +33,7 @@
 
 set -euo pipefail
 
-FRAMEWORKS=(SerialPortSwift SerialPortSwiftSimulation)
-X86_64_MIN_OS="10.11"
-# What the x86_64 module interface must say about its target (swift-module-flags: -target x86_64-apple-macos10.11).
-X86_64_TARGET_PATTERN='-target x86_64-apple-macosx?10\.11(\.0)?( |$)'
+FRAMEWORKS=(SerialPortSwift SerialPortSwiftSimulation SerialPortSwiftConcurrency)
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BUILD_DIR="$ROOT/build"
@@ -63,6 +66,32 @@ fail() {
     printf 'error: %s\n' "$*" >&2
   fi
   exit 1
+}
+
+# Prints the macOS version that the x86_64 slice of framework $1 must require (MACOSX_DEPLOYMENT_TARGET in
+# project.yml). Fails for a framework that is not listed here, so that a new framework cannot be built without
+# anyone stating its minimum.
+expected_x86_64_min_os() {
+  case "$1" in
+    SerialPortSwift | SerialPortSwiftSimulation) printf '10.11\n' ;;
+    SerialPortSwiftConcurrency) printf '10.15\n' ;;
+    *) return 1 ;;
+  esac
+}
+
+# Prints the extended regular expression that the x86_64 module interface of a framework whose minimum macOS is $1
+# must match. The interface names its target in swift-module-flags, for example -target x86_64-apple-macos10.11
+# (the OS part is "macos" or "macosx" and may carry a ".0" patch).
+x86_64_target_pattern() {
+  local min_os="$1"
+  printf '%s' "-target x86_64-apple-macosx?${min_os//./[.]}"'([.]0)?( |$)'
+}
+
+# Succeeds when framework $1 may link the Swift concurrency runtime. Only the concurrency framework may: it is the
+# one that needs it, and it is a separate framework so that the others never do. Anything not listed may not, so
+# a new framework starts out forbidden from linking it.
+may_link_concurrency_runtime() {
+  [ "$1" = "SerialPortSwiftConcurrency" ]
 }
 
 # Reads the minimum OS version out of the output of `vtool -show-build` or `otool -l` (both print the same
@@ -109,9 +138,33 @@ check_interfaces() {
   printf '    %s: %d module interface file(s), library evolution on\n' "$arch" "$count"
 }
 
+# Fails when the single-architecture Mach-O file $2 (the $3 slice of framework $1) links the Swift concurrency
+# runtime. `otool -L` lists every dylib the binary loads, weak links included: @rpath/libswift_Concurrency.dylib
+# for a deployment target before macOS 12, /usr/lib/swift/libswift_Concurrency.dylib from there on.
+check_no_concurrency_runtime() {
+  local name="$1" file="$2" arch="$3"
+  local libraries count offending
+
+  libraries="$(otool -L "$file" 2>&1)" || fail "$name: otool -L could not read the $arch slice: $libraries"
+  # The first line names the file. A binary that loads nothing else is not a framework, so an empty list means the
+  # tool did not do its job, and the absence of libswift_Concurrency would mean nothing.
+  count="$(printf '%s\n' "$libraries" | awk 'NR > 1 && NF { count++ } END { print count + 0 }')"
+  [ "$count" -gt 0 ] || fail "$name: otool -L listed no libraries for the $arch slice, so it cannot show that the slice does not link libswift_Concurrency. Output: $libraries"
+
+  # One line, so that a GitHub Actions annotation holds all of it.
+  offending="$(printf '%s\n' "$libraries" | grep -F -e 'libswift_Concurrency' | tr -s '\t\n' '  ')" || offending=""
+  if [ -n "$offending" ]; then
+    fail "$name: the $arch slice links the Swift concurrency runtime, which apps that deploy to macOS 10.11 cannot load. Only SerialPortSwiftConcurrency may. Check that no source in Sources/$name uses async/await, actors or Task, and whether the compiler's implicit import of _Concurrency is the cause. otool -L lists:$offending"
+  fi
+  printf '    %s: does not link libswift_Concurrency (%d libraries)\n' "$arch" "$count"
+}
+
 verify_xcframework() {
   local name="$1" xcframework="$2"
-  local candidate framework="" slices=0 binary archs arch thin min_os
+  local candidate framework="" slices=0 binary archs arch thin min_os expected_min_os target_pattern
+
+  expected_min_os="$(expected_x86_64_min_os "$name")" || fail "$name: Scripts/build-xcframeworks.sh does not say which macOS this framework must require. Add it to expected_x86_64_min_os."
+  target_pattern="$(x86_64_target_pattern "$expected_min_os")"
 
   step "Verifying $name.xcframework"
 
@@ -137,26 +190,31 @@ verify_xcframework() {
     esac
   done
 
-  # The x86_64 slice must deploy back to the old floor. The arm64 slice cannot go below macOS 11.0, so it is only
-  # reported.
+  # The x86_64 slice must deploy back to the framework's own floor. The arm64 slice cannot go below macOS 11.0, so
+  # its minimum is only reported.
+  #
+  # Neither slice of a framework that may not link the Swift concurrency runtime may do so.
   mkdir -p "$WORK_DIR"
   for arch in x86_64 arm64; do
     thin="$WORK_DIR/$name.$arch"
     lipo "$binary" -thin "$arch" -output "$thin" || fail "$name: lipo could not extract the $arch slice."
     min_os="$(min_os_of "$thin")"
-    rm -f "$thin"
     [ -n "$min_os" ] || fail "$name: could not read the minimum OS version of the $arch slice (vtool and otool found no LC_BUILD_VERSION or LC_VERSION_MIN_MACOSX)."
     printf '    %s minimum macOS: %s\n' "$arch" "$min_os"
     if [ "$arch" = "x86_64" ]; then
       case "$min_os" in
-        "$X86_64_MIN_OS" | "$X86_64_MIN_OS.0") ;;
-        *) fail "$name: the x86_64 slice requires macOS $min_os, expected $X86_64_MIN_OS. Check MACOSX_DEPLOYMENT_TARGET in project.yml." ;;
+        "$expected_min_os" | "$expected_min_os.0") ;;
+        *) fail "$name: the x86_64 slice requires macOS $min_os, expected $expected_min_os. Check MACOSX_DEPLOYMENT_TARGET in project.yml." ;;
       esac
     fi
+    if ! may_link_concurrency_runtime "$name"; then
+      check_no_concurrency_runtime "$name" "$thin" "$arch"
+    fi
+    rm -f "$thin"
   done
 
-  # The module interfaces, for both architectures. The x86_64 one must name the 10.11 target.
-  check_interfaces "$name" "$framework" x86_64 "$X86_64_TARGET_PATTERN"
+  # The module interfaces, for both architectures. The x86_64 one must name the framework's own target.
+  check_interfaces "$name" "$framework" x86_64 "$target_pattern"
   check_interfaces "$name" "$framework" arm64 ""
 }
 
@@ -181,10 +239,15 @@ compute_checksum() {
 
 step "Checking the toolchain"
 
-for tool in xcodegen xcodebuild lipo ditto swift unzip awk; do
+# otool is needed even where vtool is: it lists the libraries a binary loads.
+for tool in xcodegen xcodebuild lipo otool ditto swift unzip awk; do
   command -v "$tool" >/dev/null 2>&1 || fail "'$tool' is not on PATH. This script needs macOS with a full Xcode and XcodeGen (brew install xcodegen)."
 done
-command -v vtool >/dev/null 2>&1 || command -v otool >/dev/null 2>&1 || fail "neither vtool nor otool is on PATH."
+
+# Every framework needs a stated minimum macOS. Find out before the long build, not after it.
+for name in "${FRAMEWORKS[@]}"; do
+  expected_x86_64_min_os "$name" >/dev/null || fail "$name: Scripts/build-xcframeworks.sh does not say which macOS this framework must require. Add it to expected_x86_64_min_os."
+done
 
 if ! "$ROOT/Scripts/select-xcode.sh" --check; then
   if [ "${ALLOW_NEWER_XCODE:-0}" = "1" ]; then
