@@ -48,6 +48,7 @@ opts into. An app that stays on `SerialPortSwift` never links the concurrency ru
 - All of its code is inside `#if compiler(>=5.5) && canImport(_Concurrency)`, and its public types are
   `@available(macOS 10.15, *)`. With an older compiler the target builds empty, so the Swift 5.1 job keeps passing.
 - Its framework is built with a deployment target of macOS 10.15 (`project.yml`). The other two stay at 10.11.
+- It must build without warnings with every Swift from 5.5 on. Newer APIs go behind `#if compiler(>=...)`.
 - The Swift 5.1 list above does not apply to it. Everything else in this file does.
 
 **No continuation wrappers.** The channel is written with native concurrency only: actors, `AsyncStream`, `Task`.
