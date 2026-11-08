@@ -329,6 +329,38 @@ private final class ManualByteStream: SerialByteStream {
     }
 }
 
+/// A stream whose device answers before `write` returns: the reply is delivered from another thread while
+/// `write` is still busy, and `write` returns a moment after it was delivered.
+private final class AnswersBeforeWriteReturnsStream: SerialByteStream {
+    let name = "answers-early"
+    weak var delegate: SerialByteStreamDelegate?
+    private let reply: Data
+    private let busyAfterReply: TimeInterval
+
+    init(reply: Data, busyAfterReply: TimeInterval) {
+        self.reply = reply
+        self.busyAfterReply = busyAfterReply
+    }
+
+    func open() {
+        delegate?.streamDidOpen(self)
+    }
+
+    func close() {
+        delegate?.streamDidClose(self, reason: .requested)
+    }
+
+    func write(_ bytes: Data) {
+        let delivered = DispatchSemaphore(value: 0)
+        DispatchQueue.global().async {
+            self.delegate?.stream(self, didReceive: self.reply)
+            delivered.signal()
+        }
+        delivered.wait()
+        Thread.sleep(forTimeInterval: busyAfterReply)
+    }
+}
+
 /// A stream whose `open()` waits for the test before it finishes, the way a slow open does: a `close()`
 /// from another thread can overtake it. It reports like the streams in the package: a close only if it
 /// was open.
@@ -598,6 +630,27 @@ final class SerialRequestQueueTests: XCTestCase {
         // The stream times the offset from its own write, a moment before the queue notes the write.
         XCTAssertGreaterThanOrEqual(roundTrip, offset - 0.02)
         XCTAssertLessThan(roundTrip, offset + 2)
+        XCTAssertEqual(event.bytes, ascii("OK"))
+    }
+
+    /// A device can answer before `write` returns. The round trip still runs from the write, so it is not
+    /// cut to nothing: the write is stamped before it is made (found on Linux CI, where a pseudo-terminal
+    /// answered that fast).
+    func testAReplyThatArrivesBeforeTheWriteReturnsStillHasARoundTrip() {
+        let stream = AnswersBeforeWriteReturnsStream(reply: ascii("OK"), busyAfterReply: 0.05)
+        let queue = SerialRequestQueue(stream: stream, configuration: SerialRequestQueue.Configuration(defaultTimeout: 5))
+        let observer = ObserverSpy()
+        queue.addObserver(observer)
+        queue.open()
+
+        queue.send(exchange(7, "q", reply: .exactly(2)))
+        waitUntil { observer.has(.answered(7)) }
+
+        guard let event = observer.firstEvent(.answered(7)), case .answered(_, let roundTrip) = event.kind else {
+            return XCTFail("No answer published: \(observer.tags)")
+        }
+        XCTAssertGreaterThan(roundTrip, 0)
+        XCTAssertLessThan(roundTrip, 0.05, "the reply came before the write returned")
         XCTAssertEqual(event.bytes, ascii("OK"))
     }
 

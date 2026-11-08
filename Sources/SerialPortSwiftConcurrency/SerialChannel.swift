@@ -433,8 +433,10 @@
                     replyBuffer = Data()
                     // Whatever the stream has posted by now was received before this frame went out.
                     let mark = bridge.posted
-                    stream.write(exchange.frame)
+                    // Stamped before the write, as the queue does: a device that answers before
+                    // `write` returns would otherwise have its reply stamped earlier than its question.
                     let writtenAt = DispatchTime.now().uptimeNanoseconds
+                    stream.write(exchange.frame)
                     timeoutToken += 1
                     let token = timeoutToken
                     let deadline = writtenAt &+ nanoseconds(exchange.timeout ?? configuration.defaultTimeout)

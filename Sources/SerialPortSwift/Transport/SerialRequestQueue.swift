@@ -282,8 +282,10 @@ public final class SerialRequestQueue: SerialTransport {
                 publish(.sent(nil), bytes: frame)
             case .exchange(let exchange):
                 replyBuffer = Data()
-                stream.write(exchange.frame)
+                // Stamped before the write: a device that answers before `write` returns would
+                // otherwise have its reply stamped earlier than its own question.
                 let writtenAt = DispatchTime.now().uptimeNanoseconds
+                stream.write(exchange.frame)
                 timeoutToken += 1
                 let token = timeoutToken
                 onTheWire = OnTheWire(exchange: exchange, writtenAt: writtenAt, token: token)
